@@ -9,7 +9,7 @@ class YourRedisServer
 
   def start
     server = TCPServer.new(@port)
-    server.accept
+    client = server.accept
   end
 end
 
