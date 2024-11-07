@@ -10,7 +10,16 @@ class YourRedisServer
   def start
     server = TCPServer.new(@port)
     client = server.accept
-    client.puts "+PONG\r\n"
+
+    loop do
+      # Read data from client
+      request = client.gets
+
+      case request.strip
+      when 'PING'
+        client.puts("+PONG\r\n")
+      end
+    end
   end
 end
 
