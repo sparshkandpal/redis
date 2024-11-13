@@ -10,6 +10,7 @@ class YourRedisServer
   def start
     server = TCPServer.new(@port)
     @clients = []
+    @store = {}
 
     loop do
       # Add server and clients to watch list
@@ -40,7 +41,11 @@ class YourRedisServer
       response = "$#{message.bytesize}\r\n#{message}\r\n"
       client.write(response)
     elsif inputs[0].casecmp("SET").zero?
-      
+      @store[inputs[1]] = inputs[2]
+      client.write("+OK\r\n")
+    elsif inputs[0].casecmp("GET").zero?
+      message = @store[inputs[1]]
+      client.write("+#{message}\r\n")
     end
 
   rescue EOFError
