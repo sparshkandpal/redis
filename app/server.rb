@@ -31,14 +31,24 @@ class YourRedisServer
   def handle_client(client)
     request = client.readpartial(1024)
 
+    puts("req #{request}")
+
     if request.start_with?("*1\r\n$4\r\nPING\r\n")
       client.write("+PONG\r\n")
+    elsif request.start_with?("*2\r\n$4\r\nECHO\r\n")
+      message = request[18..].strip 
+      response = "$#{message.bytesize}\r\n#{message}\r\n"
+      client.write(response)
     end
 
   rescue EOFError
     # If client disconnected, remove it from the clients list and close the socket
     @clients.delete(client)
     client.close
+  end
+
+  def echo(request)
+
   end
 end
 
