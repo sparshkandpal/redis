@@ -31,14 +31,16 @@ class YourRedisServer
   def handle_client(client)
     request = client.readpartial(1024)
 
-    puts("req #{request}")
+    inputs = parser(request)
 
-    if request.start_with?("*1\r\n$4\r\nPING\r\n")
+    if inputs[0].casecmp("PING").zero?
       client.write("+PONG\r\n")
-    elsif request.start_with?("*2\r\n$4\r\nECHO\r\n")
-      message = request[18..].strip 
+    elsif inputs[0].casecmp("ECHO").zero?
+      message = inputs[1] 
       response = "$#{message.bytesize}\r\n#{message}\r\n"
       client.write(response)
+    elsif inputs[0].casecmp("SET").zero?
+      
     end
 
   rescue EOFError
@@ -47,8 +49,31 @@ class YourRedisServer
     client.close
   end
 
-  def echo(request)
+  def parser(request)
+    parsed_arguments = []
 
+    idx = 1
+    end_of_number  = request.index("\r\n", idx)
+    number_of_arguments = request[idx...end_of_number].to_i
+
+    idx = end_of_number + 2 
+
+    number_of_arguments.times do
+
+      idx+=1 if request[idx] == "$"
+
+      end_of_length = request.index("\r\n", idx)
+      length_of_argument = request[idx...end_of_length].to_i
+
+      idx = end_of_length + 2
+
+      argument = request[idx...(idx + length_of_argument)]
+      parsed_arguments << argument
+
+      idx += length_of_argument + 2
+    end
+
+    parsed_arguments
   end
 end
 
