@@ -55,7 +55,12 @@ class YourRedisServer
         client.write("+#{message}\r\n")
       end
     elsif inputs[0].casecmp("INCR").zero?
-      @store[inputs[1]] = @store[inputs[1]].to_i + 1
+      if @store[inputs[1]]
+        @store[inputs[1]] = @store[inputs[1]].to_i + 1
+      else
+        @store[inputs[1]] = 1
+      end
+
       client.write(":#{@store[inputs[1]]}\r\n")
     end
 
