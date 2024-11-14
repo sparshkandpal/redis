@@ -54,6 +54,9 @@ class YourRedisServer
       else
         client.write("+#{message}\r\n")
       end
+    elsif inputs[0].casecmp("INCR").zero?
+      @store[inputs[1]] = @store[inputs[1]].to_i + 1
+      client.write(":#{@store[inputs[1]]}\r\n")
     end
 
   rescue EOFError
