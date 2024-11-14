@@ -12,6 +12,7 @@ class YourRedisServer
     @clients = []
     @store = {}
     @expiry = {}
+    @multi = {}
 
     loop do
       # Add server and clients to watch list
@@ -35,7 +36,14 @@ class YourRedisServer
 
     inputs = parser(request)
 
-    if inputs[0].casecmp("PING").zero?
+    if @multi[client] == true
+      client.write("+QUEUED\r\n")
+    end
+
+    if inputs[0].casecmp("MULTI").zero?
+      @multi[client] = true
+      client.write("+OK\r\n")
+    elsif inputs[0].casecmp("PING").zero?
       client.write("+PONG\r\n")
     elsif inputs[0].casecmp("ECHO").zero?
       message = inputs[1] 
