@@ -39,6 +39,7 @@ class YourRedisServer
     if @multi[client] && !inputs[0].casecmp("EXEC").zero?
       @multi[client] << inputs
       client.write("+QUEUED\r\n")
+      return
     end
 
     handle_request(client, request, inputs)
@@ -75,7 +76,9 @@ class YourRedisServer
     elsif inputs[0].casecmp("GET").zero?
       message = @store[inputs[1]]
 
-      if @expiry[inputs[1]] && @expiry[inputs[1]] < Time.now
+      if message.nil?
+        client.write("$-1\r\n")
+      elsif @expiry[inputs[1]] && @expiry[inputs[1]] < Time.now
         client.write("$-1\r\n")
       else
         client.write("+#{message}\r\n")
