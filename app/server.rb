@@ -53,6 +53,7 @@ class YourRedisServer
       if !@multi[client]
         client.write("-ERR EXEC without MULTI\r\n")
       elsif @multi[client].size.zero?
+        @multi[client] = nil
         client.write("*0\r\n")
       else ## to return an aray
         client.write("-Will implement\r\n")
