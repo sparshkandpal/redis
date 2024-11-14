@@ -36,12 +36,29 @@ class YourRedisServer
 
     inputs = parser(request)
 
-    if @multi[client] == true
+    if @multi[client] && !inputs[0].casecmp("EXEC").zero?
+      @multi[client] << inputs
       client.write("+QUEUED\r\n")
     end
 
-    if inputs[0].casecmp("MULTI").zero?
-      @multi[client] = true
+    handle_request(client, request, inputs)
+  rescue EOFError
+    # If client disconnected, remove it from the clients list and close the socket
+    @clients.delete(client)
+    client.close
+  end
+
+  def handle_request(client, request, inputs)
+    if inputs[0].casecmp("EXEC").zero?
+      if !@multi[client]
+        client.write("-ERR EXEC without MULTI\r\n")
+      elsif @multi[client].size.zero?
+        client.write("*0\r\n")
+      else ## to return an aray
+        client.write("-Will implement\r\n")
+      end
+    elsif inputs[0].casecmp("MULTI").zero?
+      @multi[client] = []
       client.write("+OK\r\n")
     elsif inputs[0].casecmp("PING").zero?
       client.write("+PONG\r\n")
@@ -73,11 +90,6 @@ class YourRedisServer
         client.write(":#{@store[inputs[1]]}\r\n")
       end
     end
-
-  rescue EOFError
-    # If client disconnected, remove it from the clients list and close the socket
-    @clients.delete(client)
-    client.close
   end
 
   def parser(request)
