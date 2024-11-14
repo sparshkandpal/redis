@@ -55,13 +55,15 @@ class YourRedisServer
         client.write("+#{message}\r\n")
       end
     elsif inputs[0].casecmp("INCR").zero?
-      if @store[inputs[1]]
+      if @store[inputs[1]] &&  @store[inputs[1]].to_s.match?(/\A-?\d+\z/)
         @store[inputs[1]] = @store[inputs[1]].to_i + 1
+        client.write(":#{@store[inputs[1]]}\r\n")
+      elsif @store[inputs[1]]
+        client.write("-ERR value is not an integer or out of range\r\n")
       else
         @store[inputs[1]] = 1
+        client.write(":#{@store[inputs[1]]}\r\n")
       end
-
-      client.write(":#{@store[inputs[1]]}\r\n")
     end
 
   rescue EOFError
