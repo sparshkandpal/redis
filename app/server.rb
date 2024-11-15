@@ -8,7 +8,7 @@ class YourRedisServer
   end
 
   def start
-    server = TCPServer.new(@port)
+    server = TCPServer.new(@port) 
     @clients = []
     @store = {}
     @expiry = {}
@@ -140,4 +140,14 @@ class YourRedisServer
   end
 end
 
-YourRedisServer.new(6379).start
+def parse_port
+  port_flag_index = ARGV.index('--port')
+  if port_flag_index && ARGV[port_flag_index + 1]
+    ARGV[port_flag_index + 1].to_i
+  else
+    6379 # Default port
+  end
+end
+
+port = parse_port
+YourRedisServer.new(port).start
