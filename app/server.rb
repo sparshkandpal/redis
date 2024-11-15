@@ -36,7 +36,14 @@ class YourRedisServer
 
     inputs = parser(request)
 
-    if @multi[client] && !inputs[0].casecmp("EXEC").zero?
+    if inputs[0].casecmp("DISCARD").zero?
+      if @multi[client]
+        @multi[client] = nil
+        response = "+OK\r\n"
+      else
+        response = "-ERR DISCARD without MULTI\r\n"
+      end
+    elsif @multi[client] && !inputs[0].casecmp("EXEC").zero?
       @multi[client] << inputs
       response = "+QUEUED\r\n"
     elsif inputs[0].casecmp("EXEC").zero? && @multi[client] && @multi[client].size() > 0
