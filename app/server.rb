@@ -65,7 +65,14 @@ class YourRedisServer
   end
 
   def handle_request(client, inputs)
-    if inputs[0].casecmp("EXEC").zero?
+    if inputs[0].casecmp("DISCARD").zero?
+      if @multi[client]
+        @multi[client] = nil
+        response = "+OK\r\n"
+      else
+        response = "-ERR DISCARD without MULTI\r\n"
+      end
+    elsif inputs[0].casecmp("EXEC").zero?
       if !@multi[client]
        response = "-ERR EXEC without MULTI\r\n"
       elsif @multi[client].size.zero?
@@ -77,6 +84,8 @@ class YourRedisServer
     elsif inputs[0].casecmp("MULTI").zero?
       @multi[client] = []
       response = "+OK\r\n"
+    elsif inputs[0].casecmp("INFO").zero?
+      response = "$11\r\nrole:master\r\n"
     elsif inputs[0].casecmp("PING").zero?
       response = "+PONG\r\n"
     elsif inputs[0].casecmp("ECHO").zero?
