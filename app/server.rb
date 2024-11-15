@@ -38,62 +38,71 @@ class YourRedisServer
 
     if @multi[client] && !inputs[0].casecmp("EXEC").zero?
       @multi[client] << inputs
-      client.write("+QUEUED\r\n")
-      return
+      response = "+QUEUED\r\n"
+    elsif inputs[0].casecmp("EXEC").zero? && @multi[client] && @multi[client].size() > 0
+      response = "*#{@multi[client].size}\r\n"
+      @multi[client].each do |inputs|
+        exec_response = handle_request(client, inputs)
+        response = response + exec_response.strip + "\r\n"
+      end
+      @multi[client] = nil  # Clear the multi queue after execution
+      response = response
+    else
+      response = handle_request(client, inputs)
     end
-
-    handle_request(client, request, inputs)
+    client.write(response)
   rescue EOFError
     # If client disconnected, remove it from the clients list and close the socket
     @clients.delete(client)
     client.close
   end
 
-  def handle_request(client, request, inputs)
+  def handle_request(client, inputs)
     if inputs[0].casecmp("EXEC").zero?
       if !@multi[client]
-        client.write("-ERR EXEC without MULTI\r\n")
+       response = "-ERR EXEC without MULTI\r\n"
       elsif @multi[client].size.zero?
         @multi[client] = nil
-        client.write("*0\r\n")
+        response = "*0\r\n"
       else ## to return an aray
-        client.write("-Will implement\r\n")
+        response = "-Will implement\r\n"
       end
     elsif inputs[0].casecmp("MULTI").zero?
       @multi[client] = []
-      client.write("+OK\r\n")
+      response = "+OK\r\n"
     elsif inputs[0].casecmp("PING").zero?
-      client.write("+PONG\r\n")
+      response = "+PONG\r\n"
     elsif inputs[0].casecmp("ECHO").zero?
       message = inputs[1] 
       response = "$#{message.bytesize}\r\n#{message}\r\n"
-      client.write(response)
     elsif inputs[0].casecmp("SET").zero?
       @expiry[inputs[1]] = Time.now + (inputs.last.to_i/1000.to_f) if inputs[3]
       @store[inputs[1]] = inputs[2]
 
-      client.write("+OK\r\n")
+      response = "+OK\r\n"
     elsif inputs[0].casecmp("GET").zero?
       message = @store[inputs[1]]
 
       if message.nil?
-        client.write("$-1\r\n")
+        response = "$-1\r\n"
       elsif @expiry[inputs[1]] && @expiry[inputs[1]] < Time.now
-        client.write("$-1\r\n")
+        response = "$-1\r\n"
       else
-        client.write("+#{message}\r\n")
+        response = "+#{message}\r\n"
       end
     elsif inputs[0].casecmp("INCR").zero?
       if @store[inputs[1]] &&  @store[inputs[1]].to_s.match?(/\A-?\d+\z/)
         @store[inputs[1]] = @store[inputs[1]].to_i + 1
-        client.write(":#{@store[inputs[1]]}\r\n")
+        response = ":#{@store[inputs[1]]}\r\n"
       elsif @store[inputs[1]]
-        client.write("-ERR value is not an integer or out of range\r\n")
+        response = "-ERR value is not an integer or out of range\r\n"
       else
         @store[inputs[1]] = 1
-        client.write(":#{@store[inputs[1]]}\r\n")
+        response = ":#{@store[inputs[1]]}\r\n"
       end
     end
+
+    response
   end
 
   def parser(request)
