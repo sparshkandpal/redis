@@ -76,8 +76,17 @@ class YourRedisServer
       @multi[client] = []
       response = "+OK\r\n"
     elsif inputs[0].casecmp("INFO").zero? && inputs[1].casecmp("replication").zero?
-      role = @port_details[@port] || 'master'
-      response = "$#{5 + role.length}\r\nrole:#{role}\r\n"
+      port_details = @port_details[@port]
+      master_replid = @port_details['master_replid']
+      master_repl_offset = @port_details['master_repl_offset']
+
+      if port_details == 'slave'
+        data = "role:slave"
+        response = "$#{data.bytesize}\r\n#{data}\r\n"
+      else
+        data = "role:master\r\nmaster_replid:#{master_replid}\r\nmaster_repl_offset:#{master_repl_offset}"
+        response = "$#{data.bytesize}\r\n#{data}\r\n"
+      end
     elsif inputs[0].casecmp("PING").zero?
       response = "+PONG\r\n"
     elsif inputs[0].casecmp("ECHO").zero?
@@ -155,8 +164,12 @@ end
     if replica_of_index && ARGV[replica_of_index + 1]
       master_port = ARGV[replica_of_index + 1].split.last.to_i
       port_details[port] = 'slave'
-      port_details[master_port] = 'master'
+    else
+      port_details[port] = 'master'
     end
+
+    port_details['master_replid'] = '8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb'
+    port_details['master_repl_offset'] = '0'
 
     [port, port_details]
   end
