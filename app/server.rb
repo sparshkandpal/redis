@@ -141,5 +141,25 @@ class YourRedisServer
   end
 end
 
+  def parse_port
+    port_details = {}
+
+    port_flag_index = ARGV.index('--port')
+    port = if port_flag_index && ARGV[port_flag_index + 1]
+             ARGV[port_flag_index + 1].to_i
+           else
+             6379 # Default port
+           end
+
+    replica_of_index = ARGV.index('--replicaof')
+    if replica_of_index && ARGV[replica_of_index + 1]
+      master_port = ARGV[replica_of_index + 1].split.last.to_i
+      port_details[port] = 'slave'
+      port_details[master_port] = 'master'
+    end
+
+    [port, port_details]
+  end
+
 port, port_details = parse_port
 YourRedisServer.new(port, port_details).start
