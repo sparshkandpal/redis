@@ -165,7 +165,7 @@ end
       master_host = ARGV[replica_of_index + 1].split.first
       master_port = ARGV[replica_of_index + 1].split.last.to_i
       port_details[port] = 'slave'
-      send_handshake_message(master_host, master_port)
+      send_handshake_message(master_host, master_port, port)
     else
       port_details[port] = 'master'
     end
@@ -176,9 +176,13 @@ end
     [port, port_details]
   end
 
-   def send_handshake_message(host, port)
+   def send_handshake_message(host, port, listening_port)
     socket = TCPSocket.open(host, port)
     socket.write("*1\r\n$4\r\nPING\r\n")
+    socket.readpartial(1024)
+    socket.write("*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n#{listening_port}\r\n")
+    socket.readpartial(1024)
+    socket.write("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n")
   end
 
 port, port_details = parse_port
