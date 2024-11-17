@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'socket'
+require 'base64'
 
 class YourRedisServer
   def initialize(port, port_details)
@@ -65,7 +66,6 @@ class YourRedisServer
           exec_response = handle_request(client, inputs)
           response = response + exec_response
         end
-        reponse = response
       elsif !@multi[client]
        response = "-ERR EXEC without MULTI\r\n"
       else @multi[client].size.zero?
@@ -92,7 +92,14 @@ class YourRedisServer
     elsif inputs[0].casecmp("REPLCONF").zero?
       response = "+OK\r\n"
     elsif inputs[0].casecmp("PSYNC").zero?
-      response = "+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n"
+      full_resync_response = "+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n"
+  
+      # Replication data, encoded as bulk response
+      x = Base64.decode64('UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog==')
+      replication_data = "$#{x.length}\r\n#{x}"
+      
+      # Concatenate the full resync response and replication data as a single response
+      response = full_resync_response + replication_data
     elsif inputs[0].casecmp("ECHO").zero?
       message = inputs[1] 
       response = "$#{message.bytesize}\r\n#{message}\r\n"
