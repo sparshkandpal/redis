@@ -3,8 +3,9 @@
 require 'socket'
 
 class YourRedisServer
-  def initialize(port)
+  def initialize(port, port_details)
     @port = port
+    @port_details = port_details
   end
 
   def start
@@ -36,27 +37,7 @@ class YourRedisServer
 
     inputs = parser(request)
 
-    if inputs[0].casecmp("DISCARD").zero?
-      if @multi[client]
-        @multi[client] = nil
-        response = "+OK\r\n"
-      else
-        response = "-ERR DISCARD without MULTI\r\n"
-      end
-    elsif @multi[client] && !inputs[0].casecmp("EXEC").zero?
-      @multi[client] << inputs
-      response = "+QUEUED\r\n"
-    elsif inputs[0].casecmp("EXEC").zero? && @multi[client] && @multi[client].size() > 0
-      response = "*#{@multi[client].size}\r\n"
-      @multi[client].each do |inputs|
-        exec_response = handle_request(client, inputs)
-        response = response + exec_response.strip + "\r\n"
-      end
-      @multi[client] = nil  # Clear the multi queue after execution
-      response = response
-    else
-      response = handle_request(client, inputs)
-    end
+    response = handle_request(client, inputs)
     client.write(response)
   rescue EOFError
     # If client disconnected, remove it from the clients list and close the socket
@@ -72,20 +53,31 @@ class YourRedisServer
       else
         response = "-ERR DISCARD without MULTI\r\n"
       end
+    elsif @multi[client] && !inputs[0].casecmp("EXEC").zero?
+      @multi[client] << inputs
+      response = "+QUEUED\r\n"
     elsif inputs[0].casecmp("EXEC").zero?
-      if !@multi[client]
+      if @multi[client] && @multi[client].size() > 0
+        response = "*#{@multi[client].size}\r\n"
+        multi_inputs = @multi[client]
+        @multi.delete(client)
+        multi_inputs.each do |inputs|
+          exec_response = handle_request(client, inputs)
+          response = response + exec_response
+        end
+        reponse = response
+      elsif !@multi[client]
        response = "-ERR EXEC without MULTI\r\n"
-      elsif @multi[client].size.zero?
+      else @multi[client].size.zero?
         @multi[client] = nil
         response = "*0\r\n"
-      else ## to return an aray
-        response = "-Will implement\r\n"
       end
     elsif inputs[0].casecmp("MULTI").zero?
       @multi[client] = []
       response = "+OK\r\n"
-    elsif inputs[0].casecmp("INFO").zero?
-      response = "$11\r\nrole:master\r\n"
+    elsif inputs[0].casecmp("INFO").zero? && inputs[1].casecmp("replication").zero?
+      role = @port_details[@port] || 'master'
+      response = "$#{5 + role.length}\r\nrole:#{role}\r\n"
     elsif inputs[0].casecmp("PING").zero?
       response = "+PONG\r\n"
     elsif inputs[0].casecmp("ECHO").zero?
@@ -149,14 +141,5 @@ class YourRedisServer
   end
 end
 
-def parse_port
-  port_flag_index = ARGV.index('--port')
-  if port_flag_index && ARGV[port_flag_index + 1]
-    ARGV[port_flag_index + 1].to_i
-  else
-    6379 # Default port
-  end
-end
-
-port = parse_port
-YourRedisServer.new(port).start
+port, port_details = parse_port
+YourRedisServer.new(port, port_details).start
