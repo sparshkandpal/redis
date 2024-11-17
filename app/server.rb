@@ -162,8 +162,10 @@ end
 
     replica_of_index = ARGV.index('--replicaof')
     if replica_of_index && ARGV[replica_of_index + 1]
+      master_host = ARGV[replica_of_index + 1].split.first
       master_port = ARGV[replica_of_index + 1].split.last.to_i
       port_details[port] = 'slave'
+      send_handshake_message(master_host, master_port)
     else
       port_details[port] = 'master'
     end
@@ -172,6 +174,11 @@ end
     port_details['master_repl_offset'] = '0'
 
     [port, port_details]
+  end
+
+   def send_handshake_message(host, port)
+    socket = TCPSocket.open(host, port)
+    socket.write("*1\r\n$4\r\nPING\r\n")
   end
 
 port, port_details = parse_port
