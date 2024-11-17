@@ -89,6 +89,10 @@ class YourRedisServer
       end
     elsif inputs[0].casecmp("PING").zero?
       response = "+PONG\r\n"
+    elsif inputs[0].casecmp("REPLCONF").zero?
+      response = "+OK\r\n"
+    elsif inputs[0].casecmp("PSYNC").zero?
+      response = "+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n"
     elsif inputs[0].casecmp("ECHO").zero?
       message = inputs[1] 
       response = "$#{message.bytesize}\r\n#{message}\r\n"
