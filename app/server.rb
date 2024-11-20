@@ -15,6 +15,7 @@ class YourRedisServer
     @store = {}
     @expiry = {}
     @multi = {}
+    @slave_sockets = []
 
     loop do
       # Add server and clients to watch list
@@ -23,10 +24,8 @@ class YourRedisServer
 
       ready_to_read.each do |ready|
         if ready == server
-          # Accept new client and add to clients list
           @clients << server.accept
         else
-          # Handle client request
           handle_client(ready)
         end
       end
@@ -38,8 +37,26 @@ class YourRedisServer
 
     inputs = parser(request)
 
-    response = handle_request(client, inputs)
-    client.write(response)
+    response, response_type = handle_request(client, inputs)
+
+    if @port_details[@port] == 'master'
+      client.write(response)
+    end
+
+    if @port_details[@port] == 'slave' && response_type == 'read'
+      client.write(response)
+    end
+
+    if @port_details[@port] == 'master' && response_type == 'Write'
+      @slave_sockets.each do |socket|
+        begin
+          socket.write(request) # Propagate command over the same socket
+        rescue Errno::EPIPE, Errno::ECONNRESET
+          puts "Lost connection to slave at port #{port}. Removing it from list."
+        end
+      end
+    end
+
   rescue EOFError
     # If client disconnected, remove it from the clients list and close the socket
     @clients.delete(client)
@@ -54,16 +71,18 @@ class YourRedisServer
       else
         response = "-ERR DISCARD without MULTI\r\n"
       end
+      response_type = 'Write'
     elsif @multi[client] && !inputs[0].casecmp("EXEC").zero?
       @multi[client] << inputs
       response = "+QUEUED\r\n"
+      response_type = 'Write'
     elsif inputs[0].casecmp("EXEC").zero?
       if @multi[client] && @multi[client].size() > 0
         response = "*#{@multi[client].size}\r\n"
         multi_inputs = @multi[client]
         @multi.delete(client)
         multi_inputs.each do |inputs|
-          exec_response = handle_request(client, inputs)
+          exec_response, exec_response_type = handle_request(client, inputs)
           response = response + exec_response
         end
       elsif !@multi[client]
@@ -72,9 +91,11 @@ class YourRedisServer
         @multi[client] = nil
         response = "*0\r\n"
       end
+      response_type = 'Write'
     elsif inputs[0].casecmp("MULTI").zero?
       @multi[client] = []
       response = "+OK\r\n"
+      response_type = 'Write'
     elsif inputs[0].casecmp("INFO").zero? && inputs[1].casecmp("replication").zero?
       port_details = @port_details[@port]
       master_replid = @port_details['master_replid']
@@ -87,27 +108,42 @@ class YourRedisServer
         data = "role:master\r\nmaster_replid:#{master_replid}\r\nmaster_repl_offset:#{master_repl_offset}"
         response = "$#{data.bytesize}\r\n#{data}\r\n"
       end
+      response_type = 'read'
     elsif inputs[0].casecmp("PING").zero?
       response = "+PONG\r\n"
+      response_type = 'read'
     elsif inputs[0].casecmp("REPLCONF").zero?
+      port = inputs[2].to_i
+
+      if inputs[1] == 'listening-port'
+        begin
+           @slave_sockets.push(client)
+        rescue Errno::ECONNREFUSED
+          response = "-ERR Failed to connect to slave\r\n"
+        end
+      end
       response = "+OK\r\n"
+      response_type = 'read'
     elsif inputs[0].casecmp("PSYNC").zero?
       full_resync_response = "+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n"
   
       # Replication data, encoded as bulk response
       x = Base64.decode64('UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog==')
-      replication_data = "$#{x.length}\r\n#{x}"
+      replication_data = "$#{x.length}\r\n#{x}" 
       
       # Concatenate the full resync response and replication data as a single response
       response = full_resync_response + replication_data
+      response_type = 'read'
     elsif inputs[0].casecmp("ECHO").zero?
       message = inputs[1] 
       response = "$#{message.bytesize}\r\n#{message}\r\n"
+      response_type = 'read'
     elsif inputs[0].casecmp("SET").zero?
       @expiry[inputs[1]] = Time.now + (inputs.last.to_i/1000.to_f) if inputs[3]
       @store[inputs[1]] = inputs[2]
 
       response = "+OK\r\n"
+      response_type = 'Write'
     elsif inputs[0].casecmp("GET").zero?
       message = @store[inputs[1]]
 
@@ -118,6 +154,7 @@ class YourRedisServer
       else
         response = "+#{message}\r\n"
       end
+      response_type = 'read'
     elsif inputs[0].casecmp("INCR").zero?
       if @store[inputs[1]] &&  @store[inputs[1]].to_s.match?(/\A-?\d+\z/)
         @store[inputs[1]] = @store[inputs[1]].to_i + 1
@@ -128,9 +165,10 @@ class YourRedisServer
         @store[inputs[1]] = 1
         response = ":#{@store[inputs[1]]}\r\n"
       end
+      response_type = 'Write'
     end
 
-    response
+    return response, response_type
   end
 
   def parser(request)
