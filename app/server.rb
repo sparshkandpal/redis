@@ -14,16 +14,15 @@ class YourRedisServer
     @in_replication_mode = true       # Start in replication mode for RDB transfer
     @port_details['master_replid'] = '8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb'
     @port_details['master_repl_offset'] = '0'
-  end
-
-  def start
-    server = TCPServer.new(@port)
     @clients = []
     @store = {}
     @expiry = {}
     @multi = {}
     @slave_sockets = []
+  end
 
+  def start
+    server = TCPServer.new(@port)
     do_handshake(@master_host, @master_port, @port) if @master_port
 
     loop do
@@ -37,6 +36,7 @@ class YourRedisServer
           new_client = server.accept
           @clients << new_client
           @client_buffers[new_client] = String.new  # Use mutable string for client buffers
+          puts "New client connected: #{new_client.inspect}"
         elsif ready == @replication_socket
           handle_replication
         else
@@ -52,29 +52,35 @@ class YourRedisServer
 
       # Read incoming data and append to the buffer
       @client_buffers[client] << client.readpartial(1024)
+      puts "Client Buffer for #{client.inspect}: #{@client_buffers[client].inspect}"
 
       # Process all complete commands in the buffer
       while (inputs = extract_command_from_buffer(@client_buffers[client]))
+        puts "Handling request from client: #{inputs.inspect}"
         response, response_type = handle_request(client, inputs)
 
         if response_type == 'read'
           client.write(response)
-        end
-
-        if @port_details[@port] == 'master' && response_type == 'Write'
+        elsif response_type == 'Write'
           client.write(response)
-          @slave_sockets.each do |socket|
-            begin
-              socket.write(format_as_resp_array(inputs))
-            rescue Errno::EPIPE, Errno::ECONNRESET
-              puts "Lost connection to slave. Removing it from list."
-              @slave_sockets.delete(socket)
+
+          if @port_details[@port] == 'master'
+            # Replicate the command to all connected slave sockets
+            @slave_sockets.each do |socket|
+              begin
+                puts "Propagating command to slave socket: #{socket.inspect}"
+                socket.write(format_as_resp_array(inputs))
+              rescue Errno::EPIPE, Errno::ECONNRESET
+                puts "Lost connection to slave. Removing it from list."
+                @slave_sockets.delete(socket)
+              end
             end
           end
         end
       end
 
     rescue EOFError
+      puts "Client disconnected: #{client.inspect}"
       @clients.delete(client)
       @client_buffers.delete(client)
       client.close
@@ -85,6 +91,7 @@ class YourRedisServer
     begin
       # Read from replication socket and append to buffer
       @replication_buffer << @replication_socket.readpartial(1024)
+      puts "Replication Buffer: #{@replication_buffer.inspect}"
 
       if @in_replication_mode
         # Check if RDB file is completely received
@@ -92,14 +99,17 @@ class YourRedisServer
           # Assume RDB ends at the presence of "\r\n" for now
           @in_replication_mode = false
           @replication_buffer.clear  # Clear the buffer to prepare for subsequent commands
+          puts "RDB processed, switching to command replication mode."
         end
       else
         # Process all complete commands in the replication buffer
         while (inputs = extract_command_from_buffer(@replication_buffer))
-          handle_request(@replication_socket, inputs)
+          puts "Executing replicated command: #{inputs.inspect}"
+          handle_request(nil, inputs) # Execute command in replica
         end
       end
     rescue EOFError
+      puts "Lost connection to master. Stopping replication."
       @replication_socket.close
       @replication_socket = nil
     end
@@ -136,6 +146,7 @@ class YourRedisServer
 
     # Remove the processed command from the buffer
     buffer.slice!(0...idx)
+    puts "Extracted command: #{parsed_arguments.inspect} from buffer"
     parsed_arguments
   end
 
@@ -161,13 +172,13 @@ class YourRedisServer
       response = "+QUEUED\r\n"
       response_type = 'Write'
     elsif inputs[0].casecmp("EXEC").zero?
-      if @multi[client] && @multi[client].size() > 0
+      if @multi[client] && @multi[client].size > 0
         response = "*#{@multi[client].size}\r\n"
         multi_inputs = @multi[client]
         @multi.delete(client)
         multi_inputs.each do |inputs|
-          exec_response, exec_response_type = handle_request(client, inputs)
-          response = response + exec_response
+          exec_response, _ = handle_request(client, inputs)
+          response += exec_response
         end
       elsif !@multi[client]
         response = "-ERR EXEC without MULTI\r\n"
@@ -199,6 +210,7 @@ class YourRedisServer
     elsif inputs[0].casecmp("REPLCONF").zero?
       if inputs[1] == 'listening-port'
         @slave_sockets.push(client) unless @slave_sockets.include?(client)
+        puts "Registered slave socket: #{client.inspect}"
       end
       response = "+OK\r\n"
       response_type = 'read'
@@ -219,6 +231,7 @@ class YourRedisServer
       @store[inputs[1]] = inputs[2]
       response = "+OK\r\n"
       response_type = 'Write'
+      puts "SET command processed: #{inputs[1]} = #{inputs[2]}"
     elsif inputs[0].casecmp("GET").zero?
       message = @store[inputs[1]]
 
@@ -228,6 +241,7 @@ class YourRedisServer
         response = "$#{message.to_s.bytesize}\r\n#{message}\r\n"
       end
       response_type = 'read'
+      puts "GET command processed: #{inputs[1]} = #{message.inspect}"
     elsif inputs[0].casecmp("INCR").zero?
       if @store[inputs[1]] && @store[inputs[1]].to_s.match?(/\A-?\d+\z/)
         @store[inputs[1]] = @store[inputs[1]].to_i + 1
@@ -244,7 +258,7 @@ class YourRedisServer
       response_type = 'read'
     end
 
-    return response, response_type
+    [response, response_type]
   end
 end
 
