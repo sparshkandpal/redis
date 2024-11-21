@@ -105,7 +105,10 @@ class YourRedisServer
         # Process all complete commands in the replication buffer
         while (inputs = extract_command_from_buffer(@replication_buffer))
           puts "Executing replicated command: #{inputs.inspect}"
-          handle_request(nil, inputs) # Execute command in replica
+          response, response_type = handle_request(nil, inputs)
+          if response_type == 'Write'
+            puts "Applied replicated command: #{inputs.inspect} with response: #{response}"
+          end
         end
       end
     rescue EOFError
@@ -231,7 +234,6 @@ class YourRedisServer
       @store[inputs[1]] = inputs[2]
       response = "+OK\r\n"
       response_type = 'Write'
-      puts "SET command processed: #{inputs[1]} = #{inputs[2]}"
     elsif inputs[0].casecmp("GET").zero?
       message = @store[inputs[1]]
 
@@ -241,7 +243,6 @@ class YourRedisServer
         response = "$#{message.to_s.bytesize}\r\n#{message}\r\n"
       end
       response_type = 'read'
-      puts "GET command processed: #{inputs[1]} = #{message.inspect}"
     elsif inputs[0].casecmp("INCR").zero?
       if @store[inputs[1]] && @store[inputs[1]].to_s.match?(/\A-?\d+\z/)
         @store[inputs[1]] = @store[inputs[1]].to_i + 1
