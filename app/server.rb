@@ -4,27 +4,41 @@ require 'socket'
 require 'base64'
 
 class YourRedisServer
-  def initialize(port, port_details)
+  def initialize(port, port_details, master_port, master_host)
     @port = port
     @port_details = port_details
+    @master_port = master_port
+    @master_host = master_host
+    @client_buffers = {}
+    @replication_buffer = String.new  # Mutable replication buffer
+    @in_replication_mode = true       # Start in replication mode for RDB transfer
+    @port_details['master_replid'] = '8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb'
+    @port_details['master_repl_offset'] = '0'
   end
 
   def start
-    server = TCPServer.new(@port) 
+    server = TCPServer.new(@port)
     @clients = []
     @store = {}
     @expiry = {}
     @multi = {}
     @slave_sockets = []
 
+    do_handshake(@master_host, @master_port, @port) if @master_port
+
     loop do
       # Add server and clients to watch list
       fds_to_watch = [server, *@clients]
+      fds_to_watch << @replication_socket if @replication_socket
       ready_to_read, _, _ = IO.select(fds_to_watch)
 
       ready_to_read.each do |ready|
         if ready == server
-          @clients << server.accept
+          new_client = server.accept
+          @clients << new_client
+          @client_buffers[new_client] = String.new  # Use mutable string for client buffers
+        elsif ready == @replication_socket
+          handle_replication
         else
           handle_client(ready)
         end
@@ -33,34 +47,108 @@ class YourRedisServer
   end
 
   def handle_client(client)
-    request = client.readpartial(1024)
+    begin
+      @client_buffers[client] ||= String.new
 
-    inputs = parser(request)
+      # Read incoming data and append to the buffer
+      @client_buffers[client] << client.readpartial(1024)
 
-    response, response_type = handle_request(client, inputs)
+      # Process all complete commands in the buffer
+      while (inputs = extract_command_from_buffer(@client_buffers[client]))
+        response, response_type = handle_request(client, inputs)
 
-    if @port_details[@port] == 'master'
-      client.write(response)
-    end
+        if response_type == 'read'
+          client.write(response)
+        end
 
-    if @port_details[@port] == 'slave' && response_type == 'read'
-      client.write(response)
-    end
-
-    if @port_details[@port] == 'master' && response_type == 'Write'
-      @slave_sockets.each do |socket|
-        begin
-          socket.write(request) # Propagate command over the same socket
-        rescue Errno::EPIPE, Errno::ECONNRESET
-          puts "Lost connection to slave at port #{port}. Removing it from list."
+        if @port_details[@port] == 'master' && response_type == 'Write'
+          client.write(response)
+          @slave_sockets.each do |socket|
+            begin
+              socket.write(format_as_resp_array(inputs))
+            rescue Errno::EPIPE, Errno::ECONNRESET
+              puts "Lost connection to slave. Removing it from list."
+              @slave_sockets.delete(socket)
+            end
+          end
         end
       end
+
+    rescue EOFError
+      @clients.delete(client)
+      @client_buffers.delete(client)
+      client.close
+    end
+  end
+
+  def handle_replication
+    begin
+      # Read from replication socket and append to buffer
+      @replication_buffer << @replication_socket.readpartial(1024)
+      puts "Replication Buffer: #{@replication_buffer.inspect}"
+
+      if @in_replication_mode
+        # Check if RDB file is completely received
+        if @replication_buffer.include?("\r\n")
+          # Assume RDB ends at the presence of "\r\n" for now
+          @in_replication_mode = false
+          @replication_buffer.clear  # Clear the buffer to prepare for subsequent commands
+          puts "RDB processed, switching to command replication mode."
+        end
+      else
+        # Process all complete commands in the replication buffer
+        while (inputs = extract_command_from_buffer(@replication_buffer))
+          puts "Executing replicated command: #{inputs.inspect}"
+          handle_request(@replication_socket, inputs)
+        end
+      end
+    rescue EOFError
+      puts "Lost connection to master. Stopping replication."
+      @replication_socket.close
+      @replication_socket = nil
+    end
+  end
+
+  def extract_command_from_buffer(buffer)
+    return nil if buffer.empty?
+
+    idx = 1
+    end_of_number = buffer.index("\r\n", idx)
+    return nil if end_of_number.nil?
+
+    number_of_arguments = buffer[idx...end_of_number].to_i
+    idx = end_of_number + 2
+
+    parsed_arguments = []
+
+    number_of_arguments.times do
+      return nil if buffer[idx] != "$"
+
+      end_of_length = buffer.index("\r\n", idx + 1)
+      return nil if end_of_length.nil?
+
+      length_of_argument = buffer[(idx + 1)...end_of_length].to_i
+      idx = end_of_length + 2
+
+      return nil if buffer.size < (idx + length_of_argument + 2)
+
+      argument = buffer[idx...(idx + length_of_argument)]
+      parsed_arguments << argument
+
+      idx += length_of_argument + 2
     end
 
-  rescue EOFError
-    # If client disconnected, remove it from the clients list and close the socket
-    @clients.delete(client)
-    client.close
+    # Remove the processed command from the buffer
+    buffer.slice!(0...idx)
+    parsed_arguments
+  end
+
+  def format_as_resp_array(inputs)
+    resp_command = "*#{inputs.size}\r\n"
+    inputs.each do |input|
+      resp_command += "$#{input.bytesize}\r\n#{input}\r\n"
+    end
+    resp_command
   end
 
   def handle_request(client, inputs)
@@ -86,8 +174,8 @@ class YourRedisServer
           response = response + exec_response
         end
       elsif !@multi[client]
-       response = "-ERR EXEC without MULTI\r\n"
-      else @multi[client].size.zero?
+        response = "-ERR EXEC without MULTI\r\n"
+      else
         @multi[client] = nil
         response = "*0\r\n"
       end
@@ -113,50 +201,39 @@ class YourRedisServer
       response = "+PONG\r\n"
       response_type = 'read'
     elsif inputs[0].casecmp("REPLCONF").zero?
-      port = inputs[2].to_i
-
       if inputs[1] == 'listening-port'
-        begin
-           @slave_sockets.push(client)
-        rescue Errno::ECONNREFUSED
-          response = "-ERR Failed to connect to slave\r\n"
-        end
+        @slave_sockets.push(client) unless @slave_sockets.include?(client)
       end
       response = "+OK\r\n"
       response_type = 'read'
     elsif inputs[0].casecmp("PSYNC").zero?
       full_resync_response = "+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n"
-  
-      # Replication data, encoded as bulk response
+
       x = Base64.decode64('UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog==')
-      replication_data = "$#{x.length}\r\n#{x}" 
-      
-      # Concatenate the full resync response and replication data as a single response
+      replication_data = "$#{x.length}\r\n#{x}"
+
       response = full_resync_response + replication_data
       response_type = 'read'
     elsif inputs[0].casecmp("ECHO").zero?
-      message = inputs[1] 
+      message = inputs[1]
       response = "$#{message.bytesize}\r\n#{message}\r\n"
       response_type = 'read'
     elsif inputs[0].casecmp("SET").zero?
-      @expiry[inputs[1]] = Time.now + (inputs.last.to_i/1000.to_f) if inputs[3]
+      @expiry[inputs[1]] = Time.now + (inputs.last.to_i / 1000.to_f) if inputs[3]
       @store[inputs[1]] = inputs[2]
-
       response = "+OK\r\n"
       response_type = 'Write'
     elsif inputs[0].casecmp("GET").zero?
       message = @store[inputs[1]]
 
-      if message.nil?
-        response = "$-1\r\n"
-      elsif @expiry[inputs[1]] && @expiry[inputs[1]] < Time.now
+      if message.nil? || (@expiry[inputs[1]] && @expiry[inputs[1]] < Time.now)
         response = "$-1\r\n"
       else
-        response = "+#{message}\r\n"
+        response = "$#{message.to_s.bytesize}\r\n#{message}\r\n"
       end
       response_type = 'read'
     elsif inputs[0].casecmp("INCR").zero?
-      if @store[inputs[1]] &&  @store[inputs[1]].to_s.match?(/\A-?\d+\z/)
+      if @store[inputs[1]] && @store[inputs[1]].to_s.match?(/\A-?\d+\z/)
         @store[inputs[1]] = @store[inputs[1]].to_i + 1
         response = ":#{@store[inputs[1]]}\r\n"
       elsif @store[inputs[1]]
@@ -166,76 +243,52 @@ class YourRedisServer
         response = ":#{@store[inputs[1]]}\r\n"
       end
       response_type = 'Write'
+    else
+      response = "-ERR unknown command '#{inputs[0]}'\r\n"
+      response_type = 'read'
     end
 
     return response, response_type
   end
-
-  def parser(request)
-    parsed_arguments = []
-
-    idx = 1
-    end_of_number  = request.index("\r\n", idx)
-    number_of_arguments = request[idx...end_of_number].to_i
-
-    idx = end_of_number + 2 
-
-    number_of_arguments.times do
-
-      idx+=1 if request[idx] == "$"
-
-      end_of_length = request.index("\r\n", idx)
-      length_of_argument = request[idx...end_of_length].to_i
-
-      idx = end_of_length + 2
-
-      argument = request[idx...(idx + length_of_argument)]
-      parsed_arguments << argument
-
-      idx += length_of_argument + 2
-    end
-
-    parsed_arguments
-  end
 end
 
-  def parse_port
-    port_details = {}
+def parse_port
+  port_details = {}
+  master_port = nil
+  master_host = nil
 
-    port_flag_index = ARGV.index('--port')
-    port = if port_flag_index && ARGV[port_flag_index + 1]
-             ARGV[port_flag_index + 1].to_i
-           else
-             6379 # Default port
-           end
+  port_flag_index = ARGV.index('--port')
+  port = if port_flag_index && ARGV[port_flag_index + 1]
+           ARGV[port_flag_index + 1].to_i
+         else
+           6379
+         end
 
-    replica_of_index = ARGV.index('--replicaof')
-    if replica_of_index && ARGV[replica_of_index + 1]
-      master_host = ARGV[replica_of_index + 1].split.first
-      master_port = ARGV[replica_of_index + 1].split.last.to_i
-      port_details[port] = 'slave'
-      do_handshake(master_host, master_port, port)
-    else
-      port_details[port] = 'master'
-    end
-
-    port_details['master_replid'] = '8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb'
-    port_details['master_repl_offset'] = '0'
-
-    [port, port_details]
+  replica_of_index = ARGV.index('--replicaof')
+  if replica_of_index && ARGV[replica_of_index + 1]
+    master_host = ARGV[replica_of_index + 1].split.first
+    master_port = ARGV[replica_of_index + 1].split.last.to_i
+    port_details[port] = 'slave'
+  else
+    port_details[port] = 'master'
   end
 
-   def do_handshake(host, port, listening_port)
-    socket = TCPSocket.open(host, port)
-    socket.write("*1\r\n$4\r\nPING\r\n")
-    socket.readpartial(1024)
-    socket.write("*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n#{listening_port}\r\n")
-    socket.readpartial(1024)  
-    socket.write("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n")
-    socket.readpartial(1024)
-    socket.write("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
-    socket.readpartial(1024)
-  end
+  [port, port_details, master_port, master_host]
+end
 
-port, port_details = parse_port
-YourRedisServer.new(port, port_details).start
+def do_handshake(host, port, listening_port)
+  socket = TCPSocket.open(host, port)
+  socket.write("*1\r\n$4\r\nPING\r\n")
+  socket.readpartial(1024)
+  socket.write("*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n#{listening_port}\r\n")
+  socket.readpartial(1024)
+  socket.write("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n")
+  socket.readpartial(1024)
+  socket.write("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+  socket.readpartial(1024)
+  @replication_socket = socket
+end
+
+# Start the server
+port, port_details, master_port, master_host = parse_port
+YourRedisServer.new(port, port_details, master_port, master_host).start
