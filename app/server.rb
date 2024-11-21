@@ -85,7 +85,6 @@ class YourRedisServer
     begin
       # Read from replication socket and append to buffer
       @replication_buffer << @replication_socket.readpartial(1024)
-      puts "Replication Buffer: #{@replication_buffer.inspect}"
 
       if @in_replication_mode
         # Check if RDB file is completely received
@@ -93,17 +92,14 @@ class YourRedisServer
           # Assume RDB ends at the presence of "\r\n" for now
           @in_replication_mode = false
           @replication_buffer.clear  # Clear the buffer to prepare for subsequent commands
-          puts "RDB processed, switching to command replication mode."
         end
       else
         # Process all complete commands in the replication buffer
         while (inputs = extract_command_from_buffer(@replication_buffer))
-          puts "Executing replicated command: #{inputs.inspect}"
           handle_request(@replication_socket, inputs)
         end
       end
     rescue EOFError
-      puts "Lost connection to master. Stopping replication."
       @replication_socket.close
       @replication_socket = nil
     end
