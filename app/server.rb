@@ -19,6 +19,7 @@ class YourRedisServer
     @expiry = {}
     @multi = {}
     @slave_sockets = []
+    @replica_offset = 0               # Track the number of bytes processed by replica
   end
 
   def start
@@ -56,19 +57,15 @@ class YourRedisServer
       while (inputs = extract_command_from_buffer(@client_buffers[client]))
         response, response_type = handle_request(client, inputs)
 
-        if response_type == 'read'
-          client.write(response)
-        elsif response_type == 'Write'
-          client.write(response)
+        client.write(response)
 
-          if @port_details[@port] == 'master'
-            # Replicate the command to all connected slave sockets
-            @slave_sockets.each do |socket|
-              begin
-                socket.write(format_as_resp_array(inputs))
-              rescue Errno::EPIPE, Errno::ECONNRESET
-                @slave_sockets.delete(socket)
-              end
+        if @port_details[@port] == 'master' && response_type == 'Write'
+          # Replicate the command to all connected slave sockets
+          @slave_sockets.each do |socket|
+            begin
+              socket.write(format_as_resp_array(inputs))
+            rescue Errno::EPIPE, Errno::ECONNRESET
+              @slave_sockets.delete(socket)
             end
           end
         end
@@ -85,24 +82,27 @@ class YourRedisServer
   def handle_replication
     begin
       # Read from replication socket and append to buffer
-      @replication_buffer << @replication_socket.readpartial(1024)
+      data = @replication_socket.readpartial(1024)
+      @replication_buffer << data
 
-      puts "clear #{@replication_buffer}"
+      # Increment the replica offset for the raw bytes received
+      @replica_offset += data.bytesize
+      
       if @in_replication_mode
         # Check if RDB file is completely received
         if @replication_buffer.bytesize >= 93
           @in_replication_mode = false
           @replication_buffer.slice!(0...93)
           @replica_offset = 0
+
           puts "RDB processed, switching to command replication mode."
-          puts "new #{@replication_buffer}"
         end
       end
 
       # Process all complete commands in the replication buffer
       while (inputs = extract_command_from_buffer(@replication_buffer))
         response, response_type = handle_request(nil, inputs)
-        @replica_offset = @replica_offset + @replication_buffer.bytesize
+
         if response_type == 'Write'
           puts "Applied replicated command: #{inputs.inspect} with response: #{response}"
         elsif response_type == 'ack'
@@ -159,6 +159,9 @@ class YourRedisServer
   end
 
   def handle_request(client, inputs)
+    response = ''
+    response_type = 'read'
+
     if inputs[0].casecmp("DISCARD").zero?
       if @multi[client]
         @multi[client] = nil
@@ -194,7 +197,7 @@ class YourRedisServer
     elsif inputs[0].casecmp("INFO").zero? && inputs[1].casecmp("replication").zero?
       port_details = @port_details[@port]
       master_replid = @port_details['master_replid']
-      master_repl_offset = @port_details['master_repl_offset']
+      master_repl_offset = @replica_offset.to_s
 
       if port_details == 'slave'
         data = "role:slave"
@@ -203,23 +206,19 @@ class YourRedisServer
         data = "role:master\r\nmaster_replid:#{master_replid}\r\nmaster_repl_offset:#{master_repl_offset}"
         response = "$#{data.bytesize}\r\n#{data}\r\n"
       end
-      response_type = 'read'
     elsif inputs[0].casecmp("PING").zero?
       response = "+PONG\r\n"
-      response_type = 'read'
     elsif inputs[0].casecmp("REPLCONF").zero?
       puts "sparsh #{inputs}" 
       if inputs[1] == 'listening-port'
         @slave_sockets.push(client) unless @slave_sockets.include?(client)
         puts "Registered slave socket: #{client.inspect}"
         response = "+OK\r\n"
-        response_type = 'read'
       elsif inputs[1] == 'GETACK'
         response = "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$#{@replica_offset.to_s.bytesize}\r\n#{@replica_offset}\r\n"
         response_type = 'ack'
       else
         response = "+OK\r\n"
-        response_type = 'read'
       end
     elsif inputs[0].casecmp("PSYNC").zero?
       full_resync_response = "+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n"
@@ -228,11 +227,9 @@ class YourRedisServer
       replication_data = "$#{x.length}\r\n#{x}"
 
       response = full_resync_response + replication_data
-      response_type = 'read'
     elsif inputs[0].casecmp("ECHO").zero?
       message = inputs[1]
       response = "$#{message.bytesize}\r\n#{message}\r\n"
-      response_type = 'read'
     elsif inputs[0].casecmp("SET").zero?
       @expiry[inputs[1]] = Time.now + (inputs.last.to_i / 1000.to_f) if inputs[3]
       @store[inputs[1]] = inputs[2]
@@ -246,7 +243,6 @@ class YourRedisServer
       else
         response = "$#{message.to_s.bytesize}\r\n#{message}\r\n"
       end
-      response_type = 'read'
     elsif inputs[0].casecmp("INCR").zero?
       if @store[inputs[1]] && @store[inputs[1]].to_s.match?(/\A-?\d+\z/)
         @store[inputs[1]] = @store[inputs[1]].to_i + 1
@@ -260,7 +256,6 @@ class YourRedisServer
       response_type = 'Write'
     else
       response = "-ERR unknown command '#{inputs[0]}'\r\n"
-      response_type = 'read'
     end
 
     [response, response_type]
