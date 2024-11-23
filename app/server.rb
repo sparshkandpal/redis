@@ -32,19 +32,24 @@ class YourRedisServer
       fds_to_watch << @replication_socket if @replication_socket
       ready_to_read, _, _ = IO.select(fds_to_watch)
 
+      # Process replication socket first if it's ready
+      if @replication_socket && ready_to_read.include?(@replication_socket)
+        handle_replication
+        ready_to_read.delete(@replication_socket)
+      end
+
       ready_to_read.each do |ready|
         if ready == server
           new_client = server.accept
           @clients << new_client
-          @client_buffers[new_client] = String.new  # Use mutable string for client buffers
-        elsif ready == @replication_socket
-          handle_replication
+          @client_buffers[new_client] = String.new
         else
           handle_client(ready)
         end
       end
     end
   end
+
 
   def handle_client(client)
     begin
