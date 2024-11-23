@@ -90,6 +90,7 @@ class YourRedisServer
       
       if @in_replication_mode
         # Check if RDB file is completely received
+        puts "buffer #{@replication_buffer}"
         if @replication_buffer.bytesize >= 93
           @in_replication_mode = false
           @replication_buffer.slice!(0...93)
@@ -207,7 +208,7 @@ class YourRedisServer
         response = "$#{data.bytesize}\r\n#{data}\r\n"
       end
     elsif inputs[0].casecmp("WAIT").zero?
-      response = "$-1\r\n"
+      response = ":#{@slave_sockets.size}\r\n"
     elsif inputs[0].casecmp("PING").zero?
       response = "+PONG\r\n"
     elsif inputs[0].casecmp("REPLCONF").zero?
