@@ -22,8 +22,8 @@ class YourRedisServer
   end
 
   def start
-    server = TCPServer.new(@port)
     do_handshake(@master_host, @master_port, @port) if @master_port
+    server = TCPServer.new(@port)
 
     loop do
       # Add server and clients to watch list
@@ -87,23 +87,26 @@ class YourRedisServer
       # Read from replication socket and append to buffer
       @replication_buffer << @replication_socket.readpartial(1024)
 
+      puts "clear #{@replication_buffer}"
       if @in_replication_mode
         # Check if RDB file is completely received
-        if @replication_buffer.include?("\r\n")
-          # Assume RDB ends at the presence of "\r\n" for now
+        if @replication_buffer.bytesize >= 93
           @in_replication_mode = false
-          @replication_buffer.clear  # Clear the buffer to prepare for subsequent commands
+          @replication_buffer.slice!(0...93)
+          @replica_offset = 0
           puts "RDB processed, switching to command replication mode."
+          puts "new #{@replication_buffer}"
         end
-      else
-        # Process all complete commands in the replication buffer
-        while (inputs = extract_command_from_buffer(@replication_buffer))
-          response, response_type = handle_request(nil, inputs)
-          if response_type == 'Write'
-            puts "Applied replicated command: #{inputs.inspect} with response: #{response}"
-          elsif response_type == 'ack'
-            @replication_socket.write(response)
-          end
+      end
+
+      # Process all complete commands in the replication buffer
+      while (inputs = extract_command_from_buffer(@replication_buffer))
+        response, response_type = handle_request(nil, inputs)
+        @replica_offset = @replica_offset + @replication_buffer.bytesize
+        if response_type == 'Write'
+          puts "Applied replicated command: #{inputs.inspect} with response: #{response}"
+        elsif response_type == 'ack'
+          @replication_socket.write(response)
         end
       end
     rescue EOFError
@@ -212,7 +215,7 @@ class YourRedisServer
         response = "+OK\r\n"
         response_type = 'read'
       elsif inputs[1] == 'GETACK'
-        response = "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n"
+        response = "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$#{@replica_offset.to_s.bytesize}\r\n#{@replica_offset}\r\n"
         response_type = 'ack'
       else
         response = "+OK\r\n"
