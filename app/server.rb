@@ -206,6 +206,8 @@ class YourRedisServer
         data = "role:master\r\nmaster_replid:#{master_replid}\r\nmaster_repl_offset:#{master_repl_offset}"
         response = "$#{data.bytesize}\r\n#{data}\r\n"
       end
+    elsif inputs[0].casecmp("WAIT").zero?
+      response = "$-1\r\n"
     elsif inputs[0].casecmp("PING").zero?
       response = "+PONG\r\n"
     elsif inputs[0].casecmp("REPLCONF").zero?
