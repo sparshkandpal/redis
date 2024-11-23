@@ -69,15 +69,15 @@ class YourRedisServer
           @slave_sockets.each do |socket|
             begin
               socket.write(format_as_resp_array(inputs))
-            rescue Errno::EPIPE, Errno::ECONNRESET
+            rescue Errno::EPIPE, Errno::ECONNRESET, IOError
               @slave_sockets.delete(socket)
             end
           end
         end
       end
 
-    rescue EOFError
-      puts "Client disconnected: #{client.inspect}"
+    rescue EOFError, IOError => e
+      puts "Client disconnected: #{client.inspect} (#{e.message})"
       @clients.delete(client)
       @client_buffers.delete(client)
       client.close
@@ -90,19 +90,66 @@ class YourRedisServer
       data = @replication_socket.readpartial(1024)
       @replication_buffer << data
 
-      # Increment the replica offset for the raw bytes received
-      @replica_offset += data.bytesize
-      
       if @in_replication_mode
-        # Check if RDB file is completely received
-        puts "buffer #{@replication_buffer}"
-        if @replication_buffer.bytesize >= 93
-          @in_replication_mode = false
-          @replication_buffer.slice!(0...93)
-          @replica_offset = 0
-
-          puts "RDB processed, switching to command replication mode."
+        # Process any status lines starting with '+'
+        while @replication_buffer.start_with?('+')
+          end_of_line = @replication_buffer.index("\r\n")
+          if end_of_line
+            status_line = @replication_buffer.slice!(0..end_of_line+1)
+            puts "Received status line: #{status_line.strip}"
+            # Optionally parse the master replication ID and offset
+            if status_line.start_with?("+FULLRESYNC")
+              parts = status_line.strip.split
+              if parts.length >= 3
+                @port_details['master_replid'] = parts[1]
+                @port_details['master_repl_offset'] = parts[2]
+                puts "Master replid: #{@port_details['master_replid']}, offset: #{@port_details['master_repl_offset']}"
+              end
+            end
+          else
+            # Wait for more data
+            return
+          end
         end
+
+        # Now, expect the RDB data starting with '$'
+        if @replication_buffer[0] == '$'
+          # Existing code to process RDB data
+          end_of_length = @replication_buffer.index("\r\n")
+          if end_of_length
+            length_str = @replication_buffer[1...end_of_length]
+            length = length_str.to_i
+            rdb_data_start = end_of_length + 2
+            total_length = rdb_data_start + length  # No extra \r\n after contents
+
+            if @replication_buffer.bytesize >= total_length
+              # Extract the RDB data
+              rdb_data = @replication_buffer[rdb_data_start, length]
+              # Process the RDB data if needed (e.g., load into your in-memory store)
+
+              # Remove the RDB data from the buffer
+              @replication_buffer.slice!(0...total_length)
+              @in_replication_mode = false
+              @replica_offset = 0
+              puts "RDB processed, switching to command replication mode."
+            else
+              # Wait for more data
+              return
+            end
+          else
+            # Wait for more data (length line not complete)
+            return
+          end
+        else
+          # Invalid protocol, handle error
+          puts "Invalid RDB data format"
+          @replication_socket.close
+          @replication_socket = nil
+          return
+        end
+      else
+        # Increment the replica offset for the raw bytes received
+        @replica_offset += data.bytesize
       end
 
       # Process all complete commands in the replication buffer
@@ -123,6 +170,11 @@ class YourRedisServer
 
   def extract_command_from_buffer(buffer)
     return nil if buffer.empty?
+
+    if buffer[0] != '*'
+      # Invalid protocol
+      return nil
+    end
 
     idx = 1
     end_of_number = buffer.index("\r\n", idx)
@@ -200,7 +252,7 @@ class YourRedisServer
       @multi[client] = []
       response = "+OK\r\n"
       response_type = 'Write'
-    elsif inputs[0].casecmp("INFO").zero? && inputs[1].casecmp("replication").zero?
+    elsif inputs[0].casecmp("INFO").zero? && inputs[1]&.casecmp("replication").zero?
       port_details = @port_details[@port]
       master_replid = @port_details['master_replid']
       master_repl_offset = @replica_offset.to_s
@@ -219,8 +271,12 @@ class YourRedisServer
     elsif inputs[0].casecmp("REPLCONF").zero?
       puts "sparsh #{inputs}" 
       if inputs[1] == 'listening-port'
-        @slave_sockets.push(client) unless @slave_sockets.include?(client)
-        puts "Registered slave socket: #{client.inspect}"
+        if client
+          @slave_sockets.push(client) unless @slave_sockets.include?(client)
+          puts "Registered slave socket: #{client.inspect}"
+        else
+          puts "Warning: REPLCONF listening-port received with client=nil"
+        end
         response = "+OK\r\n"
       elsif inputs[1] == 'GETACK'
         response = "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$#{@replica_offset.to_s.bytesize}\r\n#{@replica_offset}\r\n"
@@ -303,7 +359,7 @@ def do_handshake(host, port, listening_port)
   socket.write("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n")
   socket.readpartial(1024)
   socket.write("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
-  socket.readpartial(1024)
+  # Do not read the response here; let handle_replication process it
   @replication_socket = socket
 end
 
