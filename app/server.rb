@@ -2,13 +2,16 @@
 
 require 'socket'
 require 'base64'
+require 'fileutils'
 
 class YourRedisServer
-  def initialize(port, port_details, master_port, master_host)
+  def initialize(port, port_details, master_port, master_host, filepath, filename)
     @port = port
     @port_details = port_details
     @master_port = master_port
     @master_host = master_host
+    @filepath = filepath
+    @filename = filename
     @client_buffers = {}
     @replication_buffer = String.new  # Mutable replication buffer
     @in_replication_mode = true       # Start in replication mode for RDB transfer
@@ -19,7 +22,8 @@ class YourRedisServer
     @expiry = {}
     @multi = {}
     @slave_sockets = []
-    @replica_offset = 0               # Track the number of bytes processed by replica
+    @replica_offset = 0
+    @all_replica_offset = {}           # Track the number of bytes processed by replica
   end
 
   def start
@@ -268,6 +272,13 @@ class YourRedisServer
       response = ":#{@slave_sockets.size}\r\n"
     elsif inputs[0].casecmp("PING").zero?
       response = "+PONG\r\n"
+    elsif inputs[0].casecmp("CONFIG").zero?
+      if  inputs[2].casecmp("dir").zero?
+        response = "*2\r\n$3\r\ndir\r\n$#{@filepath.bytesize}\r\n#{@filepath}\r\n"
+      else
+        response = "*2\r\n$10\r\ndbfilename\r\n$#{@filename.bytesize}\r\n#{@filename}\r\n"
+      end
+      response_type = "read"
     elsif inputs[0].casecmp("REPLCONF").zero?
       puts "sparsh #{inputs}" 
       if inputs[1] == 'listening-port'
@@ -281,6 +292,9 @@ class YourRedisServer
       elsif inputs[1] == 'GETACK'
         response = "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$#{@replica_offset.to_s.bytesize}\r\n#{@replica_offset}\r\n"
         response_type = 'ack'
+      elsif  inputs[1] == 'ACK'
+        @all_replica_offset[client] == inputs[2]
+        response_type = 'read'
       else
         response = "+OK\r\n"
       end
@@ -330,6 +344,16 @@ def parse_port
   port_details = {}
   master_port = nil
   master_host = nil
+  filepath = nil
+  filename = nil
+
+  dir_index = ARGV.index('--dir')
+
+  filepath = ARGV[dir_index + 1] if dir_index
+
+  dbfile_index = ARGV.index('--dbfilename')
+
+  filename = ARGV[dbfile_index + 1] if dbfile_index
 
   port_flag_index = ARGV.index('--port')
   port = if port_flag_index && ARGV[port_flag_index + 1]
@@ -347,7 +371,7 @@ def parse_port
     port_details[port] = 'master'
   end
 
-  [port, port_details, master_port, master_host]
+  [port, port_details, master_port, master_host, filepath, filename]
 end
 
 def do_handshake(host, port, listening_port)
@@ -364,5 +388,5 @@ def do_handshake(host, port, listening_port)
 end
 
 # Start the server
-port, port_details, master_port, master_host = parse_port
-YourRedisServer.new(port, port_details, master_port, master_host).start
+port, port_details, master_port, master_host, filepath, filename = parse_port
+YourRedisServer.new(port, port_details, master_port, master_host, filepath, filename).start
