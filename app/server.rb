@@ -23,7 +23,7 @@ class YourRedisServer
     @multi = {}
     @slave_sockets = []
     @replica_offset = 0
-    @all_replica_offset = {}           # Track the number of bytes processed by replica
+    @all_replica_offset = {} # Track the number of bytes processed by replica
   end
 
   def start
@@ -268,6 +268,13 @@ class YourRedisServer
         data = "role:master\r\nmaster_replid:#{master_replid}\r\nmaster_repl_offset:#{master_repl_offset}"
         response = "$#{data.bytesize}\r\n#{data}\r\n"
       end
+    elsif inputs[0].casecmp("TYPE").zero?
+      if @store[inputs[1]]
+        response = "+string\r\n"
+      else
+        response = "+none\r\n"
+      end
+      response_type = 'read'
     elsif inputs[0].casecmp("WAIT").zero?
       response = ":#{@slave_sockets.size}\r\n"
     elsif inputs[0].casecmp("PING").zero?
@@ -277,6 +284,14 @@ class YourRedisServer
         response = "*2\r\n$3\r\ndir\r\n$#{@filepath.bytesize}\r\n#{@filepath}\r\n"
       else
         response = "*2\r\n$10\r\ndbfilename\r\n$#{@filename.bytesize}\r\n#{@filename}\r\n"
+      end
+      response_type = "read"
+    elsif inputs[0].casecmp("KEYS").zero?
+      matching_keys = @store.keys
+
+      response = "*#{matching_keys.size}\r\n"
+      matching_keys.each do |key|
+        response += "$#{key.bytesize}\r\n#{key}\r\n"
       end
       response_type = "read"
     elsif inputs[0].casecmp("REPLCONF").zero?
