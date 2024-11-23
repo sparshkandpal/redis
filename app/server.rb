@@ -269,12 +269,17 @@ class YourRedisServer
         response = "$#{data.bytesize}\r\n#{data}\r\n"
       end
     elsif inputs[0].casecmp("TYPE").zero?
-      if @store[inputs[1]]
+      puts "type #{@store[inputs[1]].class}"
+      if @store[inputs[1]].class == Array
+        response = "+stream\r\n"
+      elsif @store[inputs[1]]
         response = "+string\r\n"
       else
         response = "+none\r\n"
       end
-      response_type = 'read'
+    elsif inputs[0].casecmp("XADD").zero?
+      @store[inputs[1]] = inputs.shift(2)
+      response = "$#{inputs[0].bytesize}\r\n#{inputs[0]}\r\n"
     elsif inputs[0].casecmp("WAIT").zero?
       response = ":#{@slave_sockets.size}\r\n"
     elsif inputs[0].casecmp("PING").zero?
