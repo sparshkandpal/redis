@@ -280,7 +280,10 @@ class YourRedisServer
     elsif inputs[0].casecmp("XADD").zero?
       stream_id = inputs[2].split('-')
 
-      if stream_id[1] == '*'
+      if stream_id[0] == '*'
+        stream_id[1] = 0
+        stream_id[0] = (Time.now.to_f * 1000).to_i
+      elsif stream_id[1] == '*'
         if stream_id[0].to_i == 0
           stream_id[1] = 1
         elsif stream_id[0].to_i > @valid_stream_time
