@@ -1,5 +1,3 @@
-# frozen_string_literal: true
-
 require 'socket'
 require 'base64'
 require 'fileutils'
@@ -269,7 +267,6 @@ class YourRedisServer
         response = "$#{data.bytesize}\r\n#{data}\r\n"
       end
     elsif inputs[0].casecmp("TYPE").zero?
-      puts "type #{@store[inputs[1]].class}"
       if @store[inputs[1]].class == Array
         response = "+stream\r\n"
       elsif @store[inputs[1]]
@@ -278,6 +275,7 @@ class YourRedisServer
         response = "+none\r\n"
       end
     elsif inputs[0].casecmp("XADD").zero?
+      key = inputs[1]
       stream_id = inputs[2].split('-')
 
       if stream_id[0] == '*'
@@ -293,7 +291,6 @@ class YourRedisServer
         end
       end
 
-      puts "stream #{stream_id}"
       if stream_id[0].to_i == 0 && stream_id[1].to_i == 0
         response = "-ERR The ID specified in XADD must be greater than 0-0\r\n"
       elsif @valid_stream_time > stream_id[0].to_i ||  (@valid_stream_time == stream_id[0].to_i && @valid_stream_sequence >= stream_id[1].to_i)
@@ -301,10 +298,42 @@ class YourRedisServer
       else
         @valid_stream_time = stream_id[0].to_i
         @valid_stream_sequence = stream_id[1].to_i
-        @store[inputs[1]] = inputs.shift(2)
         new_id = "#{stream_id[0]}-#{stream_id[1]}"
+        inputs.shift(3)
+        array_to_push = [new_id, inputs]
+        @store[key] ||= []
+        @store[key].push(array_to_push)
         response = "$#{new_id.bytesize}\r\n#{new_id}\r\n"
       end
+    elsif inputs[0].casecmp("XRANGE").zero?
+      stream = @store[inputs[1]]
+      start_time = inputs[2]
+      end_time = inputs[3]
+
+      if start_time == '-'
+        start_time = @store[inputs[1]][0][0]
+      end
+
+      if end_time == '+'
+        end_time = @store[inputs[1]].last[0]
+      end
+
+      output_array = []
+
+      stream.each do |entry|
+        timestamp = entry[0]
+        data = entry[1]
+
+        # Start saving when the timestamp matches or exceeds the start_time
+        if timestamp >= start_time && timestamp <= end_time
+          output_array << entry
+        end
+
+        # Stop when the end_time is exceeded
+        break if timestamp > end_time
+      end
+
+      response = parse_array_response(output_array)
     elsif inputs[0].casecmp("WAIT").zero?
       response = ":#{@slave_sockets.size}\r\n"
     elsif inputs[0].casecmp("PING").zero?
@@ -383,6 +412,34 @@ class YourRedisServer
 
     [response, response_type]
   end
+end
+
+def parse_array_response(data)
+  puts "data #{data}"
+  puts "datasize #{data.size}"
+
+  result = ""
+
+  # Total number of top-level elements
+  result << "*#{data.size}\r\n"
+
+  puts "rs1 #{result.size}"
+  data.each do |entry|
+    timestamp, readings = entry
+
+    result << "*2\r\n"
+    result << "$#{timestamp.length}\r\n#{timestamp}\r\n"
+
+    # Add the readings
+    result << "*#{readings.size / 2}\r\n"
+    readings.each_slice(2) do |key, value|
+      result << "$#{key.length}\r\n#{key}\r\n"
+      result << "$#{value.length}\r\n#{value}\r\n"
+    end
+  end
+
+  puts "rs2 #{result.size}"
+  result
 end
 
 def parse_port
