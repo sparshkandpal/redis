@@ -280,6 +280,17 @@ class YourRedisServer
     elsif inputs[0].casecmp("XADD").zero?
       stream_id = inputs[2].split('-')
 
+      if stream_id[1] == '*'
+        if stream_id[0].to_i == 0
+          stream_id[1] = 1
+        elsif stream_id[0].to_i > @valid_stream_time
+          stream_id[1] = 0
+        else
+          stream_id[1] = @valid_stream_sequence + 1
+        end
+      end
+
+      puts "stream #{stream_id}"
       if stream_id[0].to_i == 0 && stream_id[1].to_i == 0
         response = "-ERR The ID specified in XADD must be greater than 0-0\r\n"
       elsif @valid_stream_time > stream_id[0].to_i ||  (@valid_stream_time == stream_id[0].to_i && @valid_stream_sequence >= stream_id[1].to_i)
@@ -288,7 +299,8 @@ class YourRedisServer
         @valid_stream_time = stream_id[0].to_i
         @valid_stream_sequence = stream_id[1].to_i
         @store[inputs[1]] = inputs.shift(2)
-        response = "$#{inputs[0].bytesize}\r\n#{inputs[0]}\r\n"
+        new_id = "#{stream_id[0]}-#{stream_id[1]}"
+        response = "$#{new_id.bytesize}\r\n#{new_id}\r\n"
       end
     elsif inputs[0].casecmp("WAIT").zero?
       response = ":#{@slave_sockets.size}\r\n"
