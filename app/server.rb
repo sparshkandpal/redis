@@ -24,6 +24,8 @@ class YourRedisServer
     @slave_sockets = []
     @replica_offset = 0
     @all_replica_offset = {} # Track the number of bytes processed by replica
+    @valid_stream_time = 0
+    @valid_stream_sequence = 0
   end
 
   def start
@@ -54,7 +56,6 @@ class YourRedisServer
     end
   end
 
-
   def handle_client(client)
     begin
       @client_buffers[client] ||= String.new
@@ -79,7 +80,6 @@ class YourRedisServer
           end
         end
       end
-
     rescue EOFError, IOError => e
       puts "Client disconnected: #{client.inspect} (#{e.message})"
       @clients.delete(client)
@@ -278,8 +278,18 @@ class YourRedisServer
         response = "+none\r\n"
       end
     elsif inputs[0].casecmp("XADD").zero?
-      @store[inputs[1]] = inputs.shift(2)
-      response = "$#{inputs[0].bytesize}\r\n#{inputs[0]}\r\n"
+      stream_id = inputs[2].split('-')
+
+      if stream_id[0].to_i == 0 && stream_id[1].to_i == 0
+        response = "-ERR The ID specified in XADD must be greater than 0-0\r\n"
+      elsif @valid_stream_time > stream_id[0].to_i ||  (@valid_stream_time == stream_id[0].to_i && @valid_stream_sequence >= stream_id[1].to_i)
+        response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"
+      else
+        @valid_stream_time = stream_id[0].to_i
+        @valid_stream_sequence = stream_id[1].to_i
+        @store[inputs[1]] = inputs.shift(2)
+        response = "$#{inputs[0].bytesize}\r\n#{inputs[0]}\r\n"
+      end
     elsif inputs[0].casecmp("WAIT").zero?
       response = ":#{@slave_sockets.size}\r\n"
     elsif inputs[0].casecmp("PING").zero?
@@ -312,7 +322,7 @@ class YourRedisServer
       elsif inputs[1] == 'GETACK'
         response = "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$#{@replica_offset.to_s.bytesize}\r\n#{@replica_offset}\r\n"
         response_type = 'ack'
-      elsif  inputs[1] == 'ACK'
+      elsif inputs[1] == 'ACK'
         @all_replica_offset[client] == inputs[2]
         response_type = 'read'
       else
