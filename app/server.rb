@@ -234,7 +234,7 @@ class YourRedisServer
       @multi[client] << inputs
       response = "+QUEUED\r\n"
       response_type = 'Write'
-    elsif inputs[0].casecmp("EXEC").zero?
+    elsif inputs[0].casecmp('EXEC').zero?
       if @multi[client] && @multi[client].size > 0
         response = "*#{@multi[client].size}\r\n"
         multi_inputs = @multi[client]
@@ -250,23 +250,23 @@ class YourRedisServer
         response = "*0\r\n"
       end
       response_type = 'Write'
-    elsif inputs[0].casecmp("MULTI").zero?
+    elsif inputs[0].casecmp('MULTI').zero?
       @multi[client] = []
       response = "+OK\r\n"
       response_type = 'Write'
-    elsif inputs[0].casecmp("INFO").zero? && inputs[1]&.casecmp("replication").zero?
+    elsif inputs[0].casecmp('INFO').zero? && inputs[1]&.casecmp('replication').zero?
       port_details = @port_details[@port]
       master_replid = @port_details['master_replid']
       master_repl_offset = @replica_offset.to_s
 
       if port_details == 'slave'
-        data = "role:slave"
+        data = 'role:slave'
         response = "$#{data.bytesize}\r\n#{data}\r\n"
       else
         data = "role:master\r\nmaster_replid:#{master_replid}\r\nmaster_repl_offset:#{master_repl_offset}"
         response = "$#{data.bytesize}\r\n#{data}\r\n"
       end
-    elsif inputs[0].casecmp("TYPE").zero?
+    elsif inputs[0].casecmp('TYPE').zero?
       if @store[inputs[1]].class == Array
         response = "+stream\r\n"
       elsif @store[inputs[1]]
@@ -274,7 +274,7 @@ class YourRedisServer
       else
         response = "+none\r\n"
       end
-    elsif inputs[0].casecmp("XADD").zero?
+    elsif inputs[0].casecmp('XADD').zero?
       key = inputs[1]
       stream_id = inputs[2].split('-')
 
@@ -305,7 +305,7 @@ class YourRedisServer
         @store[key].push(array_to_push)
         response = "$#{new_id.bytesize}\r\n#{new_id}\r\n"
       end
-    elsif inputs[0].casecmp("XRANGE").zero?
+    elsif inputs[0].casecmp('XRANGE').zero?
       stream = @store[inputs[1]]
       start_time = inputs[2]
       end_time = inputs[3]
@@ -334,9 +334,28 @@ class YourRedisServer
       end
 
       response = parse_array_response(output_array)
-    elsif inputs[0].casecmp("WAIT").zero?
+    elsif inputs[0].casecmp('XREAD').zero?
+      stream = @store[inputs[2]]
+
+      read_time = inputs[3]
+
+      output_array = []
+
+      stream.each do |entry|
+        timestamp = entry[0]
+        data = entry[1]
+
+        if timestamp <= read_time
+          next
+        else
+          output_array << entry
+        end
+      end
+
+      response = "*1\r\n*2\r\n$#{inputs[2].bytesize}\r\n#{inputs[2]}\r\n#{parse_array_response(output_array)}"
+    elsif inputs[0].casecmp('WAIT').zero?
       response = ":#{@slave_sockets.size}\r\n"
-    elsif inputs[0].casecmp("PING").zero?
+    elsif inputs[0].casecmp('PING').zero?
       response = "+PONG\r\n"
     elsif inputs[0].casecmp("CONFIG").zero?
       if  inputs[2].casecmp("dir").zero?
@@ -354,7 +373,7 @@ class YourRedisServer
       end
       response_type = "read"
     elsif inputs[0].casecmp("REPLCONF").zero?
-      puts "sparsh #{inputs}" 
+      puts "sparsh #{inputs}"
       if inputs[1] == 'listening-port'
         if client
           @slave_sockets.push(client) unless @slave_sockets.include?(client)
