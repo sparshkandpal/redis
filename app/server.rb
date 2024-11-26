@@ -143,8 +143,6 @@ class YourRedisServer
             return
           end
         else
-          # Invalid protocol, handle error
-          puts "Invalid RDB data format"
           @replication_socket.close
           @replication_socket = nil
           return
@@ -335,36 +333,43 @@ class YourRedisServer
 
       response = parse_array_response(output_array)
     elsif inputs[0].casecmp('XREAD').zero?
-      stream = @store[inputs[2]]
+      stream_keys = []
+      stream_ids = []
 
-      read_time = inputs[3]
+      # First loop: Collect values from @store[inputs[x]] into stream_keys as long as they exist
+      inputs.each_with_index do |input, index|
+        next if index < 2 # Skip indices 0 and 1 (based on inputs[2] as the starting point)
 
-      output_array = []
+        value = inputs[index]
 
-      stream.each do |entry|
-        timestamp = entry[0]
-        data = entry[1]
+        break if @store[value].nil?
 
-        if timestamp <= read_time
-          next
-        else
-          output_array << entry
-        end
+        stream_keys << value
       end
 
-      response = "*1\r\n*2\r\n$#{inputs[2].bytesize}\r\n#{inputs[2]}\r\n#{parse_array_response(output_array)}"
+      # Second loop: Collect the remaining input values into stream_ids
+      (inputs[stream_keys.size + 2..-1] || []).each do |input|
+        stream_ids << input
+      end
+      output_array = []
+
+      stream_keys.each_with_index do |stream_key, index|
+        output_array.push(create_output_array(stream_key, stream_ids[index]))
+      end
+
+      response = to_redis_resp(output_array)
     elsif inputs[0].casecmp('WAIT').zero?
       response = ":#{@slave_sockets.size}\r\n"
     elsif inputs[0].casecmp('PING').zero?
       response = "+PONG\r\n"
-    elsif inputs[0].casecmp("CONFIG").zero?
+    elsif inputs[0].casecmp('CONFIG').zero?
       if  inputs[2].casecmp("dir").zero?
         response = "*2\r\n$3\r\ndir\r\n$#{@filepath.bytesize}\r\n#{@filepath}\r\n"
       else
         response = "*2\r\n$10\r\ndbfilename\r\n$#{@filename.bytesize}\r\n#{@filename}\r\n"
       end
       response_type = "read"
-    elsif inputs[0].casecmp("KEYS").zero?
+    elsif inputs[0].casecmp('KEYS').zero?
       matching_keys = @store.keys
 
       response = "*#{matching_keys.size}\r\n"
@@ -372,8 +377,7 @@ class YourRedisServer
         response += "$#{key.bytesize}\r\n#{key}\r\n"
       end
       response_type = "read"
-    elsif inputs[0].casecmp("REPLCONF").zero?
-      puts "sparsh #{inputs}"
+    elsif inputs[0].casecmp('REPLCONF').zero?
       if inputs[1] == 'listening-port'
         if client
           @slave_sockets.push(client) unless @slave_sockets.include?(client)
@@ -391,22 +395,22 @@ class YourRedisServer
       else
         response = "+OK\r\n"
       end
-    elsif inputs[0].casecmp("PSYNC").zero?
+    elsif inputs[0].casecmp('PSYNC').zero?
       full_resync_response = "+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n"
 
       x = Base64.decode64('UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog==')
       replication_data = "$#{x.length}\r\n#{x}"
 
       response = full_resync_response + replication_data
-    elsif inputs[0].casecmp("ECHO").zero?
+    elsif inputs[0].casecmp('ECHO').zero?
       message = inputs[1]
       response = "$#{message.bytesize}\r\n#{message}\r\n"
-    elsif inputs[0].casecmp("SET").zero?
+    elsif inputs[0].casecmp('SET').zero?
       @expiry[inputs[1]] = Time.now + (inputs.last.to_i / 1000.to_f) if inputs[3]
       @store[inputs[1]] = inputs[2]
       response = "+OK\r\n"
       response_type = 'Write'
-    elsif inputs[0].casecmp("GET").zero?
+    elsif inputs[0].casecmp('GET').zero?
       message = @store[inputs[1]]
 
       if message.nil? || (@expiry[inputs[1]] && @expiry[inputs[1]] < Time.now)
@@ -414,7 +418,7 @@ class YourRedisServer
       else
         response = "$#{message.to_s.bytesize}\r\n#{message}\r\n"
       end
-    elsif inputs[0].casecmp("INCR").zero?
+    elsif inputs[0].casecmp('INCR').zero?
       if @store[inputs[1]] && @store[inputs[1]].to_s.match?(/\A-?\d+\z/)
         @store[inputs[1]] = @store[inputs[1]].to_i + 1
         response = ":#{@store[inputs[1]]}\r\n"
@@ -459,6 +463,27 @@ def parse_array_response(data)
 
   puts "rs2 #{result.size}"
   result
+end
+
+def create_output_array(stream_key, stream_id)
+  outer_array = [stream_key]
+  inner_array = []
+
+  stream = @store[stream_key]
+
+  return if stream.nil?
+
+  stream.each do |entry|
+    timestamp = entry[0]
+
+    if timestamp <= stream_id
+      next
+    else
+      inner_array << entry
+    end
+  end
+  outer_array.push(inner_array)
+  outer_array
 end
 
 def parse_port
@@ -506,6 +531,19 @@ def do_handshake(host, port, listening_port)
   socket.write("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
   # Do not read the response here; let handle_replication process it
   @replication_socket = socket
+end
+
+def to_redis_resp(obj)
+  if obj.is_a?(Array)
+    resp = "*#{obj.size}\r\n"
+    obj.each do |element|
+      resp += to_redis_resp(element)
+    end
+    resp
+  else
+    resp = "$#{obj.to_s.bytesize}\r\n#{obj}\r\n"
+    resp
+  end
 end
 
 # Start the server
