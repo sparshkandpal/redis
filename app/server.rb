@@ -1,6 +1,7 @@
 require 'socket'
 require 'base64'
 require 'fileutils'
+SECONDS_IN_YEAR = 365.25 * 24 * 60 * 60
 
 class YourRedisServer
   def initialize(port, port_details, master_port, master_host, filepath, filename)
@@ -296,7 +297,6 @@ class YourRedisServer
         response = "+none\r\n"
       end
     elsif inputs[0].casecmp('XREAD').zero?
-      # Parse XREAD command
       block_index = inputs.index { |arg| arg.downcase == 'block' }
       block_timeout_ms = block_index ? inputs[block_index + 1].to_i : 0
 
@@ -318,9 +318,12 @@ class YourRedisServer
       if messages_found
         # Messages are available, send them immediately
         response = to_redis_resp(output_array)
-      elsif block_timeout_ms > 0
-        # No messages, block the client
-        block_time = Time.now + block_timeout_ms / 1000.0
+      elsif block_timeout_ms >= 0
+        if block_timeout_ms == 0
+          block_time = Time.now + (1000 * SECONDS_IN_YEAR)
+        else
+          block_time = Time.now + block_timeout_ms / 1000.0
+        end
 
         @blocked_clients_mutex.synchronize do
           stream_keys.each_with_index do |stream_key, index|
