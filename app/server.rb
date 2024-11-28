@@ -301,8 +301,13 @@ class YourRedisServer
       block_timeout_ms = block_index ? inputs[block_index + 1].to_i : 0
 
       streams_index = inputs.index { |arg| arg.downcase == 'streams' }
+
       stream_keys = inputs[(streams_index + 1)...(streams_index + 1 + (inputs.size - streams_index - 1) / 2)]
-      stream_ids = inputs[-stream_keys.size..-1]
+      if inputs.last == '$'
+        stream_ids = [@store[stream_keys[0]][0][0]]
+      else
+        stream_ids = inputs[-stream_keys.size..-1]
+      end
 
       output_array = []
       messages_found = false
