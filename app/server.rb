@@ -24,7 +24,8 @@ class YourRedisServer
     @all_replica_offset = {} # Track the number of bytes processed by replica
     @valid_stream_time = 0
     @valid_stream_sequence = 0
-    @xread_blocks = {}
+    @blocked_clients = {}
+    @blocked_clients_mutex = Mutex.new
 
     load_rdb_file
   end
@@ -34,27 +35,43 @@ class YourRedisServer
     server = TCPServer.new(@port)
 
     loop do
+      # Calculate the nearest timeout for blocked clients
+      timeout = calculate_block_timeout
+
       # Add server and clients to watch list
       fds_to_watch = [server, *@clients]
       fds_to_watch << @replication_socket if @replication_socket
-      ready_to_read, _, _ = IO.select(fds_to_watch)
+      ready_to_read, _, _ = IO.select(fds_to_watch, nil, nil, timeout)
 
-      # Process replication socket first if it's ready
-      if @replication_socket && ready_to_read.include?(@replication_socket)
-        handle_replication
-        ready_to_read.delete(@replication_socket)
-      end
-
-      ready_to_read.each do |ready|
-        if ready == server
-          new_client = server.accept
-          @clients << new_client
-          @client_buffers[new_client] = String.new
-        else
-          handle_client(ready)
+      if ready_to_read
+        # Process ready sockets
+        if @replication_socket && ready_to_read.include?(@replication_socket)
+          handle_replication
+          ready_to_read.delete(@replication_socket)
         end
+
+        ready_to_read.each do |ready|
+          if ready == server
+            new_client = server.accept
+            @clients << new_client
+            @client_buffers[new_client] = String.new
+          else
+            handle_client(ready)
+          end
+        end
+      else
+        # IO.select timed out, handle timeouts
+        check_blocked_clients_for_timeouts
       end
     end
+  end
+
+  def calculate_block_timeout
+    return nil if @blocked_clients.empty?
+    now = Time.now
+    timeouts = @blocked_clients.values.flatten.map { |client_info| client_info[:block_time] - now }
+    timeout = timeouts.min
+    timeout > 0 ? timeout : 0
   end
 
   def handle_client(client)
@@ -68,9 +85,11 @@ class YourRedisServer
       while (inputs = extract_command_from_buffer(@client_buffers[client]))
         response, response_type = handle_request(client, inputs)
 
-        client.write(response)
+        if response
+          client.write(response)
+        end
 
-        if @port_details[@port] == 'master' && response_type == 'Write' 
+        if @port_details[@port] == 'master' && response_type == 'Write'
           @slave_sockets.each do |socket|
             begin
               socket.write(format_as_resp_array(inputs))
@@ -85,6 +104,8 @@ class YourRedisServer
       @clients.delete(client)
       @client_buffers.delete(client)
       client.close
+      # Remove client from any blocked lists
+      remove_client_from_blocked_list(client)
     end
   end
 
@@ -274,37 +295,88 @@ class YourRedisServer
       else
         response = "+none\r\n"
       end
-    elsif inputs[0].casecmp('XADD').zero?
-      key = inputs[1]
+    elsif inputs[0].casecmp('XREAD').zero?
+      # Parse XREAD command
+      block_index = inputs.index { |arg| arg.downcase == 'block' }
+      block_timeout_ms = block_index ? inputs[block_index + 1].to_i : 0
 
-      stream_id = inputs[2].split('-')
+      streams_index = inputs.index { |arg| arg.downcase == 'streams' }
+      stream_keys = inputs[(streams_index + 1)...(streams_index + 1 + (inputs.size - streams_index - 1) / 2)]
+      stream_ids = inputs[-stream_keys.size..-1]
 
-      if stream_id[0] == '*'
-        stream_id[1] = 0
-        stream_id[0] = (Time.now.to_f * 1000).to_i
-      elsif stream_id[1] == '*'
-        if stream_id[0].to_i == 0
-          stream_id[1] = 1
-        elsif stream_id[0].to_i > @valid_stream_time
-          stream_id[1] = 0
-        else
-          stream_id[1] = @valid_stream_sequence + 1
+      output_array = []
+      messages_found = false
+
+      stream_keys.each_with_index do |stream_key, index|
+        messages = get_messages(stream_key, stream_ids[index])
+        if messages.any?
+          messages_found = true
+          output_array << [stream_key, messages]
         end
       end
 
-      if stream_id[0].to_i == 0 && stream_id[1].to_i == 0
+      if messages_found
+        # Messages are available, send them immediately
+        response = to_redis_resp(output_array)
+      elsif block_timeout_ms > 0
+        # No messages, block the client
+        block_time = Time.now + block_timeout_ms / 1000.0
+
+        @blocked_clients_mutex.synchronize do
+          stream_keys.each_with_index do |stream_key, index|
+            @blocked_clients[stream_key] ||= []
+            @blocked_clients[stream_key] << {
+              client: client,
+              stream_id: stream_ids[index],
+              block_time: block_time
+            }
+          end
+        end
+
+        # Do not send a response now; client is blocked
+        response = nil
+      else
+        # No messages and no blocking, return null bulk string
+        response = "$-1\r\n"
+      end
+    elsif inputs[0].casecmp('XADD').zero?
+      key = inputs[1]
+      stream_id = inputs[2]
+
+      # Handle auto-generated IDs if necessary
+      if stream_id == '*'
+        timestamp = (Time.now.to_f * 1000).to_i
+        sequence = 0
+        stream_id = "#{timestamp}-#{sequence}"
+      end
+
+      stream_id_array = inputs[2].split('-')
+      if stream_id_array[1] == '*'
+        if stream_id_array[0].to_i == 0
+          stream_id_array[1] = 1
+        elsif stream_id_array[0].to_i > @valid_stream_time
+          stream_id_array[1] = 0
+        else
+          stream_id_array[1] = @valid_stream_sequence + 1
+        end
+        stream_id = "#{stream_id_array[0]}-#{stream_id_array[1]}"
+      end
+
+      # Validate stream ID
+      if stream_id == '0-0'
         response = "-ERR The ID specified in XADD must be greater than 0-0\r\n"
-      elsif @valid_stream_time > stream_id[0].to_i ||  (@valid_stream_time == stream_id[0].to_i && @valid_stream_sequence >= stream_id[1].to_i)
+      elsif @store[key] && compare_stream_ids(stream_id, @store[key].last[0]) <= 0
         response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"
       else
-        @valid_stream_time = stream_id[0].to_i
-        @valid_stream_sequence = stream_id[1].to_i
-        new_id = "#{stream_id[0]}-#{stream_id[1]}"
-        inputs.shift(3)
-        array_to_push = [new_id, inputs]
         @store[key] ||= []
-        @store[key].push(array_to_push)
-        response = "$#{new_id.bytesize}\r\n#{new_id}\r\n"
+        @store[key] << [stream_id, inputs[3..]]
+
+        @valid_stream_time, @valid_stream_sequence = stream_id.split('-').map(&:to_i)
+
+        response = "$#{stream_id.bytesize}\r\n#{stream_id}\r\n"
+
+        # After adding the message, notify blocked clients
+        notify_blocked_clients(key, stream_id)
       end
     elsif inputs[0].casecmp('XRANGE').zero?
       stream = @store[inputs[1]]
@@ -335,40 +407,6 @@ class YourRedisServer
       end
 
       response = parse_array_response(output_array)
-    elsif inputs[0].casecmp('XREAD').zero?
-      stream_keys = []
-      stream_ids = []
-      skip = inputs[1] == 'streams' ? 2 : 4
-
-      inputs.each_with_index do |input, index|
-        next if index < skip
-
-        value = inputs[index]
-
-        break if @store[value].nil?
-
-        stream_keys << value
-        @xread_blocks[value] = Time.now + (inputs[2].to_i / 1000.to_f) if inputs[1] == 'block'
-      end
-
-      # Second loop: Collect the remaining input values into stream_ids
-      (inputs[stream_keys.size + skip..-1] || []).each do |input|
-        stream_ids << input
-      end
-      output_array = []
-
-      puts "sk #{stream_keys}, si #{stream_ids}"
-
-      if @xread_blocks[stream_keys[0]] >= Time.now
-        stream_keys.each_with_index do |stream_key, index|
-          output_array.push(create_output_array(stream_key, stream_ids[index]))
-        end
-
-        puts "oa #{output_array}"
-        response = to_redis_resp(output_array)
-      else
-        response = "$-1\r\n"
-      end
     elsif inputs[0].casecmp('WAIT').zero?
       response = ":#{@slave_sockets.size}\r\n"
     elsif inputs[0].casecmp('PING').zero?
@@ -731,11 +769,96 @@ def parse_expiry(file, byte)
   end
 end
 
+def get_messages(stream_key, stream_id)
+  stream = @store[stream_key] || []
+
+  messages = stream.select do |entry|
+    id = entry[0]
+    compare_stream_ids(id, stream_id) > 0
+  end
+
+  messages.map do |entry|
+    id = entry[0]
+    data = entry[1]
+    [id, data]
+  end
+end
+
+def compare_stream_ids(id1, id2)
+  ts1, seq1 = id1.split('-').map(&:to_i)
+  ts2, seq2 = id2.split('-').map(&:to_i)
+  return ts1 <=> ts2 if ts1 != ts2
+  seq1 <=> seq2
+end
+
 def parse_metadata(file)
   d_name = parse_string(file)
   value = parse_string(file)
   # You can store the metadata if needed, e.g.,
   # @metadata[name] = value
+end
+
+def check_blocked_clients_for_timeouts
+  now = Time.now
+  @blocked_clients.each do |stream_key, clients|
+    clients.delete_if do |blocked_client|
+      if blocked_client[:block_time] <= now
+        # Timeout expired, send null bulk string
+        client = blocked_client[:client]
+        begin
+          client.write("$-1\r\n")
+        rescue IOError, Errno::EPIPE
+          # Client might have disconnected
+          @clients.delete(client)
+          @client_buffers.delete(client)
+          client.close
+        end
+        true # Remove this client from the list
+      else
+        false
+      end
+    end
+  end
+  # Remove any stream_keys with empty clients array
+  @blocked_clients.delete_if { |_, clients| clients.empty? }
+end
+
+def remove_client_from_blocked_list(client)
+  @blocked_clients.each do |stream_key, clients|
+    clients.delete_if { |blocked_client| blocked_client[:client] == client }
+  end
+  @blocked_clients.delete_if { |_, clients| clients.empty? }
+end
+
+def notify_blocked_clients(stream_key, new_stream_id)
+  @blocked_clients_mutex.synchronize do
+    return unless @blocked_clients[stream_key]
+
+    clients_to_remove = []
+
+    @blocked_clients[stream_key].each do |blocked_client|
+      if compare_stream_ids(new_stream_id, blocked_client[:stream_id]) > 0
+        # New message is available for this client
+        messages = get_messages(stream_key, blocked_client[:stream_id])
+        if messages.any?
+          response = to_redis_resp([[stream_key, messages]])
+          begin
+            blocked_client[:client].write(response)
+          rescue IOError, Errno::EPIPE
+            # Client might have disconnected
+            @clients.delete(blocked_client[:client])
+            @client_buffers.delete(blocked_client[:client])
+            blocked_client[:client].close
+          end
+        end
+        clients_to_remove << blocked_client
+      end
+    end
+
+    # Remove unblocked clients from the blocked list
+    @blocked_clients[stream_key] -= clients_to_remove
+    @blocked_clients.delete(stream_key) if @blocked_clients[stream_key].empty?
+  end
 end
 
 # Start the server
