@@ -24,6 +24,9 @@ class YourRedisServer
     @all_replica_offset = {} # Track the number of bytes processed by replica
     @valid_stream_time = 0
     @valid_stream_sequence = 0
+    @xread_blocks = {}
+
+    load_rdb_file
   end
 
   def start
@@ -67,8 +70,7 @@ class YourRedisServer
 
         client.write(response)
 
-        if @port_details[@port] == 'master' && response_type == 'Write'
-          # Replicate the command to all connected slave sockets
+        if @port_details[@port] == 'master' && response_type == 'Write' 
           @slave_sockets.each do |socket|
             begin
               socket.write(format_as_resp_array(inputs))
@@ -274,6 +276,7 @@ class YourRedisServer
       end
     elsif inputs[0].casecmp('XADD').zero?
       key = inputs[1]
+
       stream_id = inputs[2].split('-')
 
       if stream_id[0] == '*'
@@ -335,29 +338,37 @@ class YourRedisServer
     elsif inputs[0].casecmp('XREAD').zero?
       stream_keys = []
       stream_ids = []
+      skip = inputs[1] == 'streams' ? 2 : 4
 
-      # First loop: Collect values from @store[inputs[x]] into stream_keys as long as they exist
       inputs.each_with_index do |input, index|
-        next if index < 2 # Skip indices 0 and 1 (based on inputs[2] as the starting point)
+        next if index < skip
 
         value = inputs[index]
 
         break if @store[value].nil?
 
         stream_keys << value
+        @xread_blocks[value] = Time.now + (inputs[2].to_i / 1000.to_f) if inputs[1] == 'block'
       end
 
       # Second loop: Collect the remaining input values into stream_ids
-      (inputs[stream_keys.size + 2..-1] || []).each do |input|
+      (inputs[stream_keys.size + skip..-1] || []).each do |input|
         stream_ids << input
       end
       output_array = []
 
-      stream_keys.each_with_index do |stream_key, index|
-        output_array.push(create_output_array(stream_key, stream_ids[index]))
-      end
+      puts "sk #{stream_keys}, si #{stream_ids}"
 
-      response = to_redis_resp(output_array)
+      if @xread_blocks[stream_keys[0]] >= Time.now
+        stream_keys.each_with_index do |stream_key, index|
+          output_array.push(create_output_array(stream_key, stream_ids[index]))
+        end
+
+        puts "oa #{output_array}"
+        response = to_redis_resp(output_array)
+      else
+        response = "$-1\r\n"
+      end
     elsif inputs[0].casecmp('WAIT').zero?
       response = ":#{@slave_sockets.size}\r\n"
     elsif inputs[0].casecmp('PING').zero?
@@ -376,7 +387,6 @@ class YourRedisServer
       matching_keys.each do |key|
         response += "$#{key.bytesize}\r\n#{key}\r\n"
       end
-      response_type = "read"
     elsif inputs[0].casecmp('REPLCONF').zero?
       if inputs[1] == 'listening-port'
         if client
@@ -475,6 +485,7 @@ def create_output_array(stream_key, stream_id)
 
   stream.each do |entry|
     timestamp = entry[0]
+    puts "timestamp #{timestamp} / stream_id #{stream_id} / entry #{entry}"
 
     if timestamp <= stream_id
       next
@@ -482,6 +493,7 @@ def create_output_array(stream_key, stream_id)
       inner_array << entry
     end
   end
+
   outer_array.push(inner_array)
   outer_array
 end
@@ -544,6 +556,186 @@ def to_redis_resp(obj)
     resp = "$#{obj.to_s.bytesize}\r\n#{obj}\r\n"
     resp
   end
+end
+
+  def load_rdb_file
+    return unless @filepath && @filename
+
+    rdb_file = File.join(@filepath, @filename)
+    unless File.exist?(rdb_file)
+      puts "RDB file #{rdb_file} does not exist. Starting with an empty database."
+      return
+    end
+
+    File.open(rdb_file, 'rb') do |file|
+      parse_rdb_file(file)
+    end
+    puts "RDB file #{rdb_file} loaded successfully."
+  end
+
+  def parse_rdb_file(file)
+    # Read and validate the header
+    magic_string = file.read(5)
+    version = file.read(4)
+
+    unless magic_string == 'REDIS' && version.match?(/\d{4}/)
+      raise "Invalid RDB file format."
+    end
+
+    # Start parsing the body
+    loop do
+      byte = file.read(1)
+
+      break unless byte
+
+      puts "Parsing byte: #{byte.unpack('H*')[0]} at position #{file.pos - 1}"
+
+      case byte.ord
+      when 0xFA
+        puts "Found metadata section"
+        parse_metadata(file)
+      when 0xFE
+        puts "Found database section"
+        db_number = parse_length(file)
+        puts "Database number: #{db_number}"
+      when 0xFB
+        puts "Found hash table size info"
+        main_ht_size = parse_length(file)
+        puts "Main hash table size: #{main_ht_size}"
+        expires_ht_size = parse_length(file)
+        puts "Expires hash table size: #{expires_ht_size}"
+      when 0xFD, 0xFC
+        puts "Found key with expire"
+        expiry = parse_expiry(file, byte.ord)
+        value_type_byte = file.read(1)
+        raise "Unexpected EOF while reading value type" unless value_type_byte
+        value_type = value_type_byte.ord
+        puts "Value type: #{value_type}"
+        key = parse_string(file)
+        puts "Key: #{key}"
+        value = parse_value(file, value_type)
+        @store[key] = value
+        @expiry[key] = expiry if expiry
+        puts "Loaded key with expire: #{key} => #{value}, expires at #{expiry}"
+      when 0xFF
+        puts "End of RDB file"
+        checksum = file.read(8)
+        raise "Unexpected EOF while reading checksum" unless checksum && checksum.length == 8
+        break
+      else
+        value_type = byte.ord
+        puts "Found key without expire, value type: #{value_type}"
+        key = parse_string(file)
+        puts "Key: #{key}"
+        value = parse_value(file, value_type)
+        @store[key] = value
+        puts "Loaded key: #{key} => #{value}"
+      end
+    end
+end
+
+def parse_length(file)
+  first_byte = file.read(1)
+  raise "Unexpected EOF while parsing length" unless first_byte
+  first_byte = first_byte.ord
+  enc_type = (first_byte & 0xC0) >> 6
+  case enc_type
+  when 0
+    # 6-bit length
+    length = first_byte & 0x3F
+    return [false, length]
+  when 1
+    # 14-bit length
+    second_byte = file.read(1)
+    raise "Unexpected EOF while parsing length (14-bit)" unless second_byte
+    second_byte = second_byte.ord
+    length = ((first_byte & 0x3F) << 8) | second_byte
+    return [false, length]
+  when 2
+    # 32-bit length
+    bytes = file.read(4)
+    raise "Unexpected EOF while parsing length (32-bit)" unless bytes && bytes.length == 4
+    length = bytes.unpack('N')[0]  # Big-endian unsigned 32-bit integer
+    return [false, length]
+  when 3
+    # Special encoding
+    encoding = first_byte & 0x3F
+    return [true, encoding]
+  else
+    raise "Unknown length encoding in RDB file."
+  end
+end
+
+def parse_string(file)
+  is_encoded, length_or_enc = parse_length(file)
+  if !is_encoded
+    length = length_or_enc
+    # Read the string of given length
+    str = file.read(length)
+    raise "Unexpected EOF while reading string" unless str && str.length == length
+  else
+    # Special encoding
+    encoding_type = length_or_enc
+    case encoding_type
+    when 0  # 8-bit integer
+      bytes = file.read(1)
+      raise "Unexpected EOF while reading 8-bit integer" unless bytes
+      int_value = bytes.unpack('C')[0]
+      str = int_value.to_s
+    when 1  # 16-bit integer
+      bytes = file.read(2)
+      raise "Unexpected EOF while reading 16-bit integer" unless bytes && bytes.length == 2
+      int_value = bytes.unpack('s<')[0]
+      str = int_value.to_s
+    when 2  # 32-bit integer
+      bytes = file.read(4)
+      raise "Unexpected EOF while reading 32-bit integer" unless bytes && bytes.length == 4
+      int_value = bytes.unpack('l<')[0]
+      str = int_value.to_s
+    when 3
+      # LZF compressed string (not required for this challenge)
+      raise "LZF compression not supported in this challenge."
+    else
+      raise "Unknown string encoding type #{encoding_type}."
+    end
+  end
+  str
+end
+
+def parse_value(file, value_type)
+  puts "Parsing value with type: #{value_type}"
+  case value_type
+  when 0 # String
+    value = parse_string(file)
+    puts "Parsed string value: #{value}"
+    value
+  else
+    raise "Unsupported value type #{value_type}."
+  end
+end
+
+def parse_expiry(file, byte)
+  case byte
+  when 0xFD # Expire time in seconds
+    bytes = file.read(4)
+    raise "Unexpected EOF while reading expiry in seconds" unless bytes && bytes.length == 4
+    timestamp = bytes.unpack('L<')[0] # Little-endian unsigned 32-bit integer
+    Time.at(timestamp)
+  when 0xFC  # Expire time in milliseconds
+    bytes = file.read(8)
+    raise "Unexpected EOF while reading expiry in milliseconds" unless bytes && bytes.length == 8
+    timestamp = bytes.unpack('Q<')[0] # Little-endian unsigned 64-bit integer
+    Time.at(timestamp / 1000.0)
+  else
+    nil
+  end
+end
+
+def parse_metadata(file)
+  d_name = parse_string(file)
+  value = parse_string(file)
+  # You can store the metadata if needed, e.g.,
+  # @metadata[name] = value
 end
 
 # Start the server
